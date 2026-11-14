@@ -19,11 +19,12 @@ import (
 
 	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/infoschema"
-	"github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
 	"github.com/pingcap/tidb/pkg/util/execdetails"
 	"github.com/pingcap/tidb/pkg/util/set"
 	"github.com/pingcap/tidb/pkg/util/stmtsummary"
@@ -158,10 +159,11 @@ func (e *stmtSummaryRetriever) initSummaryRowsReader(sctx sessionctx.Context) (*
 	}
 
 	var rows [][]types.Datum
-	if isCurrentTable(e.table.Name.O) {
+	if isCumulativeTable(e.table.Name.O) {
+		rows = reader.GetStmtSummaryCumulativeRows()
+	} else if isCurrentTable(e.table.Name.O) {
 		rows = reader.GetStmtSummaryCurrentRows()
-	}
-	if isHistoryTable(e.table.Name.O) {
+	} else if isHistoryTable(e.table.Name.O) {
 		rows = reader.GetStmtSummaryHistoryRows()
 	}
 	return newSimpleRowsReader(rows), nil
@@ -239,6 +241,11 @@ func (r *stmtSummaryRetrieverV2) initEvictedRowsReader(sctx sessionctx.Context) 
 }
 
 func (r *stmtSummaryRetrieverV2) initSummaryRowsReader(ctx context.Context, sctx sessionctx.Context) (*rowsReader, error) {
+	if isCumulativeTable(r.table.Name.O) {
+		return nil, plannererrors.ErrNotSupportedYet.GenWithStackByArgs(
+			"cumulative statement summary table with persistent mode (v2)")
+	}
+
 	vars := sctx.GetSessionVars()
 	user := vars.User
 	tz := vars.StmtCtx.TimeZone()
@@ -344,7 +351,18 @@ func isClusterTable(originalTableName string) bool {
 	switch originalTableName {
 	case infoschema.ClusterTableStatementsSummary,
 		infoschema.ClusterTableStatementsSummaryHistory,
-		infoschema.ClusterTableStatementsSummaryEvicted:
+		infoschema.ClusterTableStatementsSummaryEvicted,
+		infoschema.ClusterTableTiDBStatementsStats:
+		return true
+	}
+
+	return false
+}
+
+func isCumulativeTable(originalTableName string) bool {
+	switch originalTableName {
+	case infoschema.TableTiDBStatementsStats,
+		infoschema.ClusterTableTiDBStatementsStats:
 		return true
 	}
 
@@ -383,7 +401,7 @@ func isEvictedTable(originalTableName string) bool {
 
 func checkPrivilege(sctx sessionctx.Context) error {
 	if !hasPriv(sctx, mysql.ProcessPriv) {
-		return plannercore.ErrSpecificAccessDenied.GenWithStackByArgs("PROCESS")
+		return plannererrors.ErrSpecificAccessDenied.GenWithStackByArgs("PROCESS")
 	}
 	return nil
 }
@@ -400,8 +418,16 @@ func buildTimeRanges(tr *plannercore.TimeRange) []*stmtsummaryv2.StmtTimeRange {
 		return nil
 	}
 
+	// Records carry whole-second begin/end, while the coarse range can carry a
+	// fractional-second bound. Floor the lower bound and ceil the upper one so the
+	// range only widens: rows the exact SQL predicates would keep must survive the
+	// coarse clipping (the retained predicates still filter precisely).
+	end := tr.EndTime.Unix()
+	if tr.EndTime.Nanosecond() != 0 {
+		end++
+	}
 	return []*stmtsummaryv2.StmtTimeRange{{
 		Begin: tr.StartTime.Unix(),
-		End:   tr.EndTime.Unix(),
+		End:   end,
 	}}
 }

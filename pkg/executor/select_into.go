@@ -24,9 +24,9 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/executor/internal/exec"
+	"github.com/pingcap/tidb/pkg/lightning/importdef"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
-	"github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 )
@@ -35,7 +35,7 @@ import (
 type SelectIntoExec struct {
 	exec.BaseExecutor
 	intoOpt *ast.SelectIntoOption
-	core.LineFieldsInfo
+	importdef.LineFieldsInfo
 
 	lineBuf   []byte
 	realBuf   []byte
@@ -121,6 +121,8 @@ func (s *SelectIntoExec) escapeField(f []byte) []byte {
 	return s.escapeBuf
 }
 
+// dumpToOutfile writes the current chunk using the configured OUTFILE format.
+// Line prefixes are written literally, outside field escaping and enclosure.
 func (s *SelectIntoExec) dumpToOutfile() error {
 	encloseFlag := false
 	var encloseByte byte
@@ -138,9 +140,10 @@ func (s *SelectIntoExec) dumpToOutfile() error {
 	}
 
 	cols := s.Children(0).Schema().Columns
-	for i := 0; i < s.chk.NumRows(); i++ {
+	s.lineBuf = append(s.lineBuf[:0], s.LinesStartingBy...)
+	for i := range s.chk.NumRows() {
 		row := s.chk.GetRow(i)
-		s.lineBuf = s.lineBuf[:0]
+		s.lineBuf = s.lineBuf[:len(s.LinesStartingBy)]
 		for j, col := range cols {
 			if j != 0 {
 				s.lineBuf = append(s.lineBuf, s.FieldsTerminatedBy...)
@@ -149,7 +152,7 @@ func (s *SelectIntoExec) dumpToOutfile() error {
 				s.lineBuf = append(s.lineBuf, nullTerm...)
 				continue
 			}
-			et := col.GetType().EvalType()
+			et := col.GetType(s.Ctx().GetExprCtx().GetEvalCtx()).EvalType()
 			if (encloseFlag && !encloseOpt) ||
 				(encloseFlag && encloseOpt && s.considerEncloseOpt(et)) {
 				s.lineBuf = append(s.lineBuf, encloseByte)
@@ -158,11 +161,11 @@ func (s *SelectIntoExec) dumpToOutfile() error {
 				s.enclosed = false
 			}
 			s.fieldBuf = s.fieldBuf[:0]
-			switch col.GetType().GetType() {
+			switch col.GetType(s.Ctx().GetExprCtx().GetEvalCtx()).GetType() {
 			case mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24, mysql.TypeLong, mysql.TypeYear:
 				s.fieldBuf = strconv.AppendInt(s.fieldBuf, row.GetInt64(j), 10)
 			case mysql.TypeLonglong:
-				if mysql.HasUnsignedFlag(col.GetType().GetFlag()) {
+				if mysql.HasUnsignedFlag(col.GetType(s.Ctx().GetExprCtx().GetEvalCtx()).GetFlag()) {
 					s.fieldBuf = strconv.AppendUint(s.fieldBuf, row.GetUint64(j), 10)
 				} else {
 					s.fieldBuf = strconv.AppendInt(s.fieldBuf, row.GetInt64(j), 10)
@@ -182,16 +185,18 @@ func (s *SelectIntoExec) dumpToOutfile() error {
 			case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeTimestamp:
 				s.fieldBuf = append(s.fieldBuf, row.GetTime(j).String()...)
 			case mysql.TypeDuration:
-				s.fieldBuf = append(s.fieldBuf, row.GetDuration(j, col.GetType().GetDecimal()).String()...)
+				s.fieldBuf = append(s.fieldBuf, row.GetDuration(j, col.GetType(s.Ctx().GetExprCtx().GetEvalCtx()).GetDecimal()).String()...)
 			case mysql.TypeEnum:
 				s.fieldBuf = append(s.fieldBuf, row.GetEnum(j).String()...)
 			case mysql.TypeSet:
 				s.fieldBuf = append(s.fieldBuf, row.GetSet(j).String()...)
 			case mysql.TypeJSON:
 				s.fieldBuf = append(s.fieldBuf, row.GetJSON(j).String()...)
+			case mysql.TypeTiDBVectorFloat32:
+				s.fieldBuf = append(s.fieldBuf, row.GetVectorFloat32(j).String()...)
 			}
 
-			switch col.GetType().EvalType() {
+			switch col.GetType(s.Ctx().GetExprCtx().GetEvalCtx()).EvalType() {
 			case types.ETString, types.ETJson:
 				s.lineBuf = append(s.lineBuf, s.escapeField(s.fieldBuf)...)
 			default:
@@ -233,7 +238,7 @@ const (
 )
 
 // DumpRealOutfile dumps a real number to lineBuf.
-func DumpRealOutfile(realBuf, lineBuf []byte, v float64, tp *types.FieldType) ([]byte, []byte) {
+func DumpRealOutfile(realBuf, lineBuf []byte, v float64, tp *types.FieldType) (_, _ []byte) {
 	prec := types.UnspecifiedLength
 	if tp.GetDecimal() > 0 && tp.GetDecimal() != mysql.NotFixedDec {
 		prec = tp.GetDecimal()

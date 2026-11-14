@@ -130,6 +130,14 @@ func SerializeTypesDuration(value types.Duration, buf []byte) []byte {
 	return SerializeInt(value.Fsp, buf)
 }
 
+// SerializeVectorFloat32 serializes VectorFloat32 type.
+func SerializeVectorFloat32(value types.VectorFloat32, buf []byte) []byte {
+	if value.SerializedSize() == 0 {
+		return serializeBuffer(types.ZeroVectorFloat32.ZeroCopySerialize(), buf)
+	}
+	return serializeBuffer(value.ZeroCopySerialize(), buf)
+}
+
 // SerializeJSONTypeCode serializes JSONTypeCode type
 func SerializeJSONTypeCode(value types.JSONTypeCode, buf []byte) []byte {
 	var tmp [JSONTypeCodeLen]byte
@@ -173,7 +181,7 @@ func SerializeBytesBuffer(value *bytes.Buffer, buf []byte) []byte {
 }
 
 // SerializeInterface serialize interface type
-func SerializeInterface(value interface{}, buf []byte) []byte {
+func SerializeInterface(value any, buf []byte) []byte {
 	switch v := value.(type) {
 	case bool:
 		buf = append(buf, BoolType)

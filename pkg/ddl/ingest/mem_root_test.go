@@ -22,7 +22,7 @@ import (
 )
 
 func TestMemoryRoot(t *testing.T) {
-	memRoot := ingest.MemRoot(ingest.NewMemRootImpl(1024, nil))
+	memRoot := ingest.MemRoot(ingest.NewMemRootImpl(1024))
 	require.Equal(t, int64(1024), memRoot.MaxMemoryQuota())
 	require.Equal(t, int64(0), memRoot.CurrentUsage())
 
@@ -57,10 +57,4 @@ func TestMemoryRoot(t *testing.T) {
 	require.True(t, memRoot.CheckConsume(10))
 	memRoot.Consume(10) // Mix usage of tag and non-tag.
 	require.Equal(t, int64(522), memRoot.CurrentUsage())
-}
-
-func TestRiskOfDiskFull(t *testing.T) {
-	require.False(t, ingest.RiskOfDiskFull(11, 100))
-	require.False(t, ingest.RiskOfDiskFull(10, 100))
-	require.True(t, ingest.RiskOfDiskFull(9, 100))
 }

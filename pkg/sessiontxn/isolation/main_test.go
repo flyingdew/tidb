@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/infoschema"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/sessionctx"
@@ -39,6 +40,7 @@ func TestMain(m *testing.M) {
 	tikv.EnableFailpoints()
 	opts := []goleak.Option{
 		goleak.IgnoreTopFunction("github.com/golang/glog.(*fileSink).flushDaemon"),
+		goleak.IgnoreTopFunction("github.com/bazelbuild/rules_go/go/tools/bzltestutil.RegisterTimeoutHandler.func1"),
 		goleak.IgnoreTopFunction("github.com/lestrrat-go/httprc.runFetchWorker"),
 		goleak.IgnoreTopFunction("go.etcd.io/etcd/client/pkg/v3/logutil.(*MergeLogger).outputLoop"),
 		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
@@ -80,7 +82,7 @@ func (a *txnAssert[T]) Check(t testing.TB) {
 	require.Equal(t, a.isolation, txnCtx.Isolation)
 	require.Equal(t, a.isolation != "", txnCtx.IsPessimistic)
 	require.Equal(t, sessVars.CheckAndGetTxnScope(), txnCtx.TxnScope)
-	require.Equal(t, sessVars.ShardAllocateStep, int64(txnCtx.ShardStep))
+	require.Equal(t, sessVars.ShardAllocateStep, int64(sessVars.GetRowIDShardGenerator().GetShardStep()))
 	require.False(t, txnCtx.IsStaleness)
 	require.GreaterOrEqual(t, txnCtx.CreateTime.UnixNano(), a.minStartTime.UnixNano())
 	require.Equal(t, a.inTxn, sessVars.InTxn())
@@ -88,7 +90,9 @@ func (a *txnAssert[T]) Check(t testing.TB) {
 	require.Equal(t, a.couldRetry, txnCtx.CouldRetry)
 	require.Equal(t, assertTxnScope, txnCtx.TxnScope)
 	require.Equal(t, assertTxnScope, provider.GetTxnScope())
+	require.Nil(t, failpoint.Enable("github.com/pingcap/tidb/pkg/sessionctx/variable/GetReplicaReadUnadjusted", "return(true)"))
 	require.Equal(t, assertReplicaReadScope, provider.GetReadReplicaScope())
+	require.Nil(t, failpoint.Disable("github.com/pingcap/tidb/pkg/sessionctx/variable/GetReplicaReadUnadjusted"))
 
 	txn, err := a.sctx.Txn(false)
 	require.NoError(t, err)
@@ -164,7 +168,7 @@ func forkScopeSettings(t *testfork.T, store kv.Storage) func() {
 		}
 	}
 
-	if testfork.PickEnum(t, "", "closetRead") != "" {
+	if testfork.PickEnum(t, "", "closetRead") != "" && !kerneltype.IsNextGen() {
 		tk.MustExec("set @@global.tidb_replica_read='closest-replicas'")
 		if zone != "" {
 			assertReplicaReadScope = zone

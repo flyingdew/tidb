@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"unicode"
 
@@ -58,6 +59,8 @@ var (
 	ErrWarnDeprecatedSyntaxNoReplacement = terror.ClassParser.NewStd(mysql.ErrWarnDeprecatedSyntaxNoReplacement)
 	// ErrWrongUsage returns for incorrect usages.
 	ErrWrongUsage = terror.ClassParser.NewStd(mysql.ErrWrongUsage)
+	// ErrWrongDBName returns for incorrect DB name.
+	ErrWrongDBName = terror.ClassParser.NewStd(mysql.ErrWrongDBName)
 	// SpecFieldPattern special result field pattern
 	SpecFieldPattern = regexp.MustCompile(`(\/\*!(M?[0-9]{5,6})?|\*\/)`)
 	specCodeStart    = regexp.MustCompile(`^\/\*!(M?[0-9]{5,6})?[ \t]*`)
@@ -77,7 +80,18 @@ type ParserConfig struct {
 	EnableWindowFunction        bool
 	EnableStrictDoubleTypeCheck bool
 	SkipPositionRecording       bool
+	// EnableUnsupportedMySQLSyntax enables parser acceptance of selected MySQL syntax unsupported by TiDB.
+	// It is intended for tools and does not imply planner or executor support.
+	EnableUnsupportedMySQLSyntax bool
 }
+
+const (
+	// maxASTDepthStmtOverhead leaves room for statement wrapper nodes on the
+	// visitor path, for example SelectStmt -> FieldList -> SelectField.
+	maxASTDepthStmtOverhead = 64
+	// maxASTDepth bounds user-controlled AST nesting before recursive visitors run.
+	maxASTDepth = maxParenthesesDepth + maxASTDepthStmtOverhead
+)
 
 //revive:enable:exported
 
@@ -90,13 +104,27 @@ type Parser struct {
 	lexer      Scanner
 	hintParser *hintParser
 
-	explicitCharset       bool
-	strictDoubleFieldType bool
+	explicitCharset              bool
+	strictDoubleFieldType        bool
+	enableMariaDB                bool
+	enableUnsupportedMySQLSyntax bool
 
 	// the following fields are used by yyParse to reduce allocation.
 	cache  []yySymType
 	yylval yySymType
 	yyVAL  *yySymType
+}
+
+// setNodeText sets the raw text on a parsed AST node and propagates the
+// NO_BACKSLASH_ESCAPES SQL mode so that Text() can correctly handle
+// backslash escapes when converting binary string literals to hex.
+func (parser *Parser) setNodeText(n interface {
+	SetText(charset.Encoding, string)
+}, text string) {
+	n.SetText(parser.lexer.client, text)
+	if setter, ok := n.(interface{ SetNoBackslashEscapes(bool) }); ok {
+		setter.SetNoBackslashEscapes(parser.lexer.sqlMode.HasNoBackslashEscapesMode())
+	}
 }
 
 func yySetOffset(yyVAL *yySymType, offset int) {
@@ -124,11 +152,29 @@ func New() *Parser {
 	p := &Parser{
 		cache: make([]yySymType, 200),
 	}
-	p.EnableWindowFunc(true)
-	p.SetStrictDoubleTypeCheck(true)
-	mode, _ := mysql.GetSQLMode(mysql.DefaultSQLMode)
-	p.SetSQLMode(mode)
+	p.reset()
 	return p
+}
+
+// Reset resets the parser.
+func (parser *Parser) Reset() {
+	clear(parser.cache)
+	parser.reset()
+}
+
+func (parser *Parser) reset() {
+	parser.explicitCharset = false
+	parser.strictDoubleFieldType = false
+	parser.enableUnsupportedMySQLSyntax = false
+	parser.EnableWindowFunc(true)
+	parser.SetStrictDoubleTypeCheck(true)
+	mode, _ := mysql.GetSQLMode(mysql.DefaultSQLMode)
+	parser.SetSQLMode(mode)
+}
+
+// SetMariaDB is setting the parser mode for extended MariaDB syntax
+func (parser *Parser) SetMariaDB(b bool) {
+	parser.enableMariaDB = b
 }
 
 // SetStrictDoubleTypeCheck enables/disables strict double type check.
@@ -141,6 +187,7 @@ func (parser *Parser) SetParserConfig(config ParserConfig) {
 	parser.EnableWindowFunc(config.EnableWindowFunction)
 	parser.SetStrictDoubleTypeCheck(config.EnableStrictDoubleTypeCheck)
 	parser.lexer.skipPositionRecording = config.SkipPositionRecording
+	parser.enableUnsupportedMySQLSyntax = config.EnableUnsupportedMySQLSyntax
 }
 
 // ParseSQL parses a query string to raw ast.StmtNode.
@@ -160,7 +207,7 @@ func (parser *Parser) ParseSQL(sql string, params ...ParseParam) (stmt []ast.Stm
 
 	warns, errs := l.Errors()
 	if len(warns) > 0 {
-		warns = append([]error(nil), warns...)
+		warns = slices.Clone(warns)
 	} else {
 		warns = nil
 	}
@@ -168,6 +215,9 @@ func (parser *Parser) ParseSQL(sql string, params ...ParseParam) (stmt []ast.Stm
 		return nil, warns, errors.Trace(errs[0])
 	}
 	for _, stmt := range parser.result {
+		if err := checkASTDepth(stmt); err != nil {
+			return nil, warns, errors.Trace(err)
+		}
 		ast.SetFlag(stmt)
 	}
 	return parser.result, warns, nil
@@ -181,6 +231,34 @@ func (parser *Parser) Parse(sql, charset, collation string) (stmt []ast.StmtNode
 
 func (parser *Parser) lastErrorAsWarn() {
 	parser.lexer.lastErrorAsWarn()
+}
+
+func checkASTDepth(stmt ast.StmtNode) error {
+	checker := astDepthChecker{}
+	ast.Walk(stmt, &checker)
+	if checker.exceeded {
+		return ErrParse.GenWithStackByArgs("AST nesting depth exceeds maximum", strconv.Itoa(maxASTDepth))
+	}
+	return nil
+}
+
+type astDepthChecker struct {
+	depth    int
+	exceeded bool
+}
+
+func (c *astDepthChecker) Enter(ast.Node) bool {
+	c.depth++
+	if c.depth > maxASTDepth {
+		c.exceeded = true
+		return true
+	}
+	return false
+}
+
+func (c *astDepthChecker) Leave(ast.Node) bool {
+	c.depth--
+	return !c.exceeded
 }
 
 // ParseOneStmt parses a query and returns an ast.StmtNode.

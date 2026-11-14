@@ -15,150 +15,210 @@
 package core
 
 import (
-	"fmt"
+	"math"
 	"testing"
 
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/expression"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/planner/core/base"
+	"github.com/pingcap/tidb/pkg/planner/core/operator/logicalop"
+	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
+	"github.com/pingcap/tidb/pkg/planner/funcdep"
 	"github.com/pingcap/tidb/pkg/planner/property"
-	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/planner/util"
+	"github.com/pingcap/tidb/pkg/planner/util/coretestsdk"
+	"github.com/pingcap/tidb/pkg/statistics"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/ranger"
 	"github.com/stretchr/testify/require"
 )
 
-type mockDataSource struct {
-	baseLogicalPlan
+func TestFindBestTaskSuite(t *testing.T) {
+	t.Run("TestCostOverflow", testCostOverflow)
+	t.Run("TestEnforcedProperty", testEnforcedProperty)
+	t.Run("TestHintCannotFitProperty", testHintCannotFitProperty)
+	t.Run("RangeCountComparison", testRangeCountComparison)
+	t.Run("RangeCountSkyline", testRangeCountSkyline)
+	t.Run("MissingStatsIndexVsFullScan", testMissingStatsIndexVsFullScan)
+	t.Run("MergeJoinLazyFD", testMergeJoinLazyFD)
 }
 
-func (ds mockDataSource) Init(ctx sessionctx.Context) *mockDataSource {
-	ds.baseLogicalPlan = newBaseLogicalPlan(ctx, "mockDS", &ds, 0)
-	return &ds
+// fdCountingChild is a join child that counts how often its FDs are extracted.
+type fdCountingChild struct {
+	*logicalop.LogicalTableDual
+	extractFDCalls int
 }
 
-func (ds *mockDataSource) findBestTask(prop *property.PhysicalProperty, planCounter *PlanCounterTp, opt *physicalOptimizeOp) (task, int64, error) {
-	// It can satisfy any of the property!
-	// Just use a TableDual for convenience.
-	p := PhysicalTableDual{}.Init(ds.SCtx(), &property.StatsInfo{RowCount: 1}, 0)
-	task := &rootTask{
-		p: p,
+func (ds *fdCountingChild) ExtractFD() *funcdep.FDSet {
+	ds.extractFDCalls++
+	return &funcdep.FDSet{HashCodeToUniqueID: make(map[string]int)}
+}
+
+// testMergeJoinLazyFD checks that GetMergeJoin only extracts the join's FDs
+// (which, for a wide DataSource, walks every column and unique index) when a
+// merge join candidate needs the constant columns to match a required order.
+func testMergeJoinLazyFD(t *testing.T) {
+	ctx := coretestsdk.MockContext()
+	defer domain.GetDomain(ctx).StatsHandle().Close()
+	newCol := func() *expression.Column {
+		return &expression.Column{UniqueID: ctx.GetSessionVars().AllocPlanColumnID(), RetType: types.NewFieldType(mysql.TypeLonglong)}
 	}
-	planCounter.Dec(1)
-	return task, 1, nil
+	newChild := func(col *expression.Column) *fdCountingChild {
+		dual := logicalop.LogicalTableDual{RowCount: 1}.Init(ctx.GetPlanCtx(), 0)
+		dual.SetSchema(expression.NewSchema(col))
+		return &fdCountingChild{LogicalTableDual: dual}
+	}
+	stats := &property.StatsInfo{RowCount: 100}
+	for _, tc := range []struct {
+		name           string
+		hasProperties  bool
+		sortByJoinKey  bool
+		wantMergeJoins int
+		wantExtractFD  int
+	}{
+		{"no merge join candidate", false, true, 0, 0},
+		{"candidate without required order", true, false, 1, 0},
+		{"candidate with required order", true, true, 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := newCol(), newCol()
+			left, right := newChild(a), newChild(b)
+			join := logicalop.LogicalJoin{JoinType: base.InnerJoin}.Init(ctx.GetPlanCtx(), 0)
+			join.SetChildren(left, right)
+			join.SetSchema(expression.MergeSchema(left.Schema(), right.Schema()))
+			eq, err := expression.NewFunction(ctx.GetExprCtx(), ast.EQ, types.NewFieldType(mysql.TypeTiny), a, b)
+			require.NoError(t, err)
+			join.EqualConditions = []*expression.ScalarFunction{eq.(*expression.ScalarFunction)}
+			if tc.hasProperties {
+				join.LeftProperties = [][]*expression.Column{{a}}
+				join.RightProperties = [][]*expression.Column{{b}}
+			}
+			prop := &property.PhysicalProperty{ExpectedCnt: math.MaxFloat64}
+			if tc.sortByJoinKey {
+				prop = property.NewPhysicalProperty(property.RootTaskType, []*expression.Column{a}, false, math.MaxFloat64, false)
+			}
+			joins := physicalop.GetMergeJoin(join, prop, join.Schema(), stats, stats, stats)
+			require.Len(t, joins, tc.wantMergeJoins)
+			require.Equal(t, tc.wantExtractFD, left.extractFDCalls)
+			require.Equal(t, tc.wantExtractFD, right.extractFDCalls)
+		})
+	}
 }
 
-// mockLogicalPlan4Test is a LogicalPlan which is used for unit test.
-// The basic assumption:
-//  1. mockLogicalPlan4Test can generate tow kinds of physical plan: physicalPlan1 and
-//     physicalPlan2. physicalPlan1 can pass the property only when they are the same
-//     order; while physicalPlan2 cannot match any of the property(in other words, we can
-//     generate it only when then property is empty).
-//  2. We have a hint for physicalPlan2.
-//  3. If the property is empty, we still need to check `canGeneratePlan2` to decide
-//     whether it can generate physicalPlan2.
-type mockLogicalPlan4Test struct {
-	baseLogicalPlan
-	// hasHintForPlan2 indicates whether this mockPlan contains hint.
-	// This hint is used to generate physicalPlan2. See the implementation
-	// of exhaustPhysicalPlans().
-	hasHintForPlan2 bool
-	// canGeneratePlan2 indicates whether this plan can generate physicalPlan2.
-	canGeneratePlan2 bool
-	// costOverflow indicates whether this plan will generate physical plan whose cost is overflowed.
-	costOverflow bool
+func testRangeCountComparison(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		threshold            int64
+		lhsRanges, rhsRanges int
+		lhsCount, rhsCount   int
+		want                 int
+	}{
+		{"disabled", 0, 1001, 1, 3, 2, 1},
+		{"below threshold", 1000, 999, 1, 3, 2, 1},
+		{"at threshold", 1000, 1000, 1, 3, 2, 1},
+		{"above threshold", 1000, 1001, 1, 3, 2, 0},
+		{"both above threshold", 1000, 1001, 1002, 3, 2, 0},
+		{"only weaker candidate above threshold", 1000, 1, 1001, 3, 2, 1},
+		{"equal predicate counts", 1000, 1001, 1, 2, 2, 0},
+		{"single range", 1, 1, 1, 3, 2, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lhs := &candidatePath{path: &util.AccessPath{Ranges: make(ranger.Ranges, tc.lhsRanges)}, eqOrInCount: tc.lhsCount}
+			rhs := &candidatePath{path: &util.AccessPath{Ranges: make(ranger.Ranges, tc.rhsRanges)}, eqOrInCount: tc.rhsCount}
+			require.Equal(t, tc.want, compareEqOrIn(lhs, rhs, tc.threshold))
+			require.Equal(t, -tc.want, compareEqOrIn(rhs, lhs, tc.threshold))
+			// IndexMerge's predicate counts remain incomparable, even with the threshold disabled.
+			lhs.path.PartialIndexPaths = []*util.AccessPath{{}}
+			require.Zero(t, compareEqOrIn(lhs, rhs, tc.threshold))
+			require.Zero(t, compareEqOrIn(rhs, lhs, tc.threshold))
+		})
+	}
 }
 
-func (p mockLogicalPlan4Test) Init(ctx sessionctx.Context) *mockLogicalPlan4Test {
-	p.baseLogicalPlan = newBaseLogicalPlan(ctx, "mockPlan", &p, 0)
-	return &p
-}
-
-func (p *mockLogicalPlan4Test) getPhysicalPlan1(prop *property.PhysicalProperty) PhysicalPlan {
-	physicalPlan1 := mockPhysicalPlan4Test{planType: 1}.Init(p.SCtx())
-	physicalPlan1.SetStats(&property.StatsInfo{RowCount: 1})
-	physicalPlan1.childrenReqProps = make([]*property.PhysicalProperty, 1)
-	physicalPlan1.childrenReqProps[0] = prop.CloneEssentialFields()
-	return physicalPlan1
-}
-
-func (p *mockLogicalPlan4Test) getPhysicalPlan2(prop *property.PhysicalProperty) PhysicalPlan {
-	physicalPlan2 := mockPhysicalPlan4Test{planType: 2}.Init(p.SCtx())
-	physicalPlan2.SetStats(&property.StatsInfo{RowCount: 1})
-	physicalPlan2.childrenReqProps = make([]*property.PhysicalProperty, 1)
-	physicalPlan2.childrenReqProps[0] = property.NewPhysicalProperty(prop.TaskTp, nil, false, prop.ExpectedCnt, false)
-	return physicalPlan2
-}
-
-func (p *mockLogicalPlan4Test) exhaustPhysicalPlans(prop *property.PhysicalProperty) ([]PhysicalPlan, bool, error) {
-	plan1 := make([]PhysicalPlan, 0, 1)
-	plan2 := make([]PhysicalPlan, 0, 1)
-	if prop.IsSortItemEmpty() && p.canGeneratePlan2 {
-		// Generate PhysicalPlan2 when the property is empty.
-		plan2 = append(plan2, p.getPhysicalPlan2(prop))
-		if p.hasHintForPlan2 {
-			return plan2, true, nil
+func testRangeCountSkyline(t *testing.T) {
+	ctx := coretestsdk.MockContext()
+	defer domain.GetDomain(ctx).StatsHandle().Close()
+	prop := property.NewPhysicalProperty(property.RootTaskType, nil, false, 0, false)
+	newCandidate := func(id int64, eqCount, rangeCount int, maxCount float64) *candidatePath {
+		return &candidatePath{
+			path: &util.AccessPath{
+				Index:               &model.IndexInfo{ID: id},
+				Ranges:              make(ranger.Ranges, rangeCount),
+				IsSingleScan:        true,
+				CountAfterAccess:    10,
+				MaxCountAfterAccess: maxCount,
+			},
+			accessCondsColMap: map[int64]int{id: -1},
+			eqOrInCount:       eqCount,
 		}
 	}
-	if all, _ := prop.AllSameOrder(); all {
-		// Generate PhysicalPlan1 when properties are the same order.
-		plan1 = append(plan1, p.getPhysicalPlan1(prop))
-	}
-	if p.hasHintForPlan2 {
-		// The hint cannot work.
-		if prop.IsSortItemEmpty() {
-			p.SCtx().GetSessionVars().StmtCtx.AppendWarning(fmt.Errorf("the hint is inapplicable for plan2"))
+	for _, pseudo := range []bool{false, true} {
+		stats := &statistics.Table{
+			HistColl:              statistics.HistColl{Pseudo: pseudo},
+			ColAndIdxExistenceMap: statistics.NewColAndIndexExistenceMapWithoutSize(),
 		}
-		return plan1, false, nil
+		if !pseudo {
+			stats.ColAndIdxExistenceMap.InsertIndex(1, true)
+			stats.ColAndIdxExistenceMap.InsertIndex(2, true)
+		}
+		lhs, rhs := newCandidate(1, 3, 1001, 10), newCandidate(2, 2, 1, 20)
+		for _, tc := range []struct {
+			threshold int64
+			want      int
+		}{{0, 1}, {1001, 1}, {1000, 0}} {
+			ctx.GetSessionVars().RangeMaxCount = tc.threshold
+			result, _ := compareCandidates(ctx.GetPlanCtx(), stats, prop, lhs, rhs)
+			require.Equal(t, tc.want, result, "pseudo=%v threshold=%d", pseudo, tc.threshold)
+			result, _ = compareCandidates(ctx.GetPlanCtx(), stats, prop, rhs, lhs)
+			require.Equal(t, -tc.want, result, "reversed: pseudo=%v threshold=%d", pseudo, tc.threshold)
+		}
 	}
-	return append(plan1, plan2...), true, nil
+
+	// Missing statistics and equality/IN counts cannot break the tie between
+	// incomparable access conditions, regardless of the range-count threshold.
+	stats := &statistics.Table{ColAndIdxExistenceMap: statistics.NewColAndIndexExistenceMapWithoutSize()}
+	stats.ColAndIdxExistenceMap.InsertIndex(2, true)
+	lhs, rhs := newCandidate(1, 3, 1001, 10), newCandidate(2, 2, 1, 10)
+	for _, tc := range []struct {
+		threshold int64
+		want      int
+	}{{0, 0}, {1001, 0}, {1000, 0}} {
+		ctx.GetSessionVars().RangeMaxCount = tc.threshold
+		result, _ := compareCandidates(ctx.GetPlanCtx(), stats, prop, lhs, rhs)
+		require.Equal(t, tc.want, result)
+		result, _ = compareCandidates(ctx.GetPlanCtx(), stats, prop, rhs, lhs)
+		require.Equal(t, -tc.want, result)
+	}
 }
 
-type mockPhysicalPlan4Test struct {
-	basePhysicalPlan
-	// 1 or 2 for physicalPlan1 or physicalPlan2.
-	// See the comment of mockLogicalPlan4Test.
-	planType int
-}
-
-func (p mockPhysicalPlan4Test) Init(ctx sessionctx.Context) *mockPhysicalPlan4Test {
-	p.basePhysicalPlan = newBasePhysicalPlan(ctx, "mockPlan", &p, 0)
-	return &p
-}
-
-func (p *mockPhysicalPlan4Test) attach2Task(tasks ...task) task {
-	t := tasks[0].copy()
-	attachPlan2Task(p, t)
-	return t
-}
-
-// MemoryUsage of mockPhysicalPlan4Test is only for testing
-func (p *mockPhysicalPlan4Test) MemoryUsage() (sum int64) {
-	return
-}
-
-func TestCostOverflow(t *testing.T) {
-	ctx := MockContext()
+func testCostOverflow(t *testing.T) {
+	ctx := coretestsdk.MockContext()
 	defer func() {
 		domain.GetDomain(ctx).StatsHandle().Close()
 	}()
 	// Plan Tree: mockPlan -> mockDataSource
-	mockPlan := mockLogicalPlan4Test{costOverflow: true}.Init(ctx)
-	mockDS := mockDataSource{}.Init(ctx)
+	mockPlan := mockLogicalPlan4Test{costOverflow: true}.Init(ctx.GetPlanCtx())
+	mockDS := logicalop.MockDataSource{}.Init(ctx.GetPlanCtx())
 	mockPlan.SetChildren(mockDS)
 	// An empty property is enough for this test.
 	prop := property.NewPhysicalProperty(property.RootTaskType, nil, false, 0, false)
-	task, _, err := mockPlan.findBestTask(prop, &PlanCounterDisabled, defaultPhysicalOptimizeOption())
+	task, err := physicalop.FindBestTask(mockPlan, prop)
 	require.NoError(t, err)
 	// The cost should be overflowed, but the task shouldn't be invalid.
-	require.False(t, task.invalid())
+	require.False(t, task.Invalid())
 }
 
-func TestEnforcedProperty(t *testing.T) {
-	ctx := MockContext()
+func testEnforcedProperty(t *testing.T) {
+	ctx := coretestsdk.MockContext()
 	defer func() {
 		domain.GetDomain(ctx).StatsHandle().Close()
 	}()
 	// PlanTree : mockLogicalPlan -> mockDataSource
-	mockPlan := mockLogicalPlan4Test{}.Init(ctx)
-	mockDS := mockDataSource{}.Init(ctx)
+	mockPlan := mockLogicalPlan4Test{}.Init(ctx.GetPlanCtx())
+	mockDS := logicalop.MockDataSource{}.Init(ctx.GetPlanCtx())
 	mockPlan.SetChildren(mockDS)
 
 	col0 := &expression.Column{UniqueID: 1}
@@ -174,22 +234,22 @@ func TestEnforcedProperty(t *testing.T) {
 		CanAddEnforcer: false,
 	}
 	// should return invalid task because no physical plan can match this property.
-	task, _, err := mockPlan.findBestTask(prop0, &PlanCounterDisabled, defaultPhysicalOptimizeOption())
+	task, err := physicalop.FindBestTask(mockPlan, prop0)
 	require.NoError(t, err)
-	require.True(t, task.invalid())
+	require.True(t, task.Invalid())
 
 	prop1 := &property.PhysicalProperty{
 		SortItems:      items,
 		CanAddEnforcer: true,
 	}
 	// should return the valid task when the property is enforced.
-	task, _, err = mockPlan.findBestTask(prop1, &PlanCounterDisabled, defaultPhysicalOptimizeOption())
+	task, err = physicalop.FindBestTask(mockPlan, prop1)
 	require.NoError(t, err)
-	require.False(t, task.invalid())
+	require.False(t, task.Invalid())
 }
 
-func TestHintCannotFitProperty(t *testing.T) {
-	ctx := MockContext()
+func testHintCannotFitProperty(t *testing.T) {
+	ctx := coretestsdk.MockContext()
 	defer func() {
 		domain.GetDomain(ctx).StatsHandle().Close()
 	}()
@@ -197,8 +257,8 @@ func TestHintCannotFitProperty(t *testing.T) {
 	mockPlan0 := mockLogicalPlan4Test{
 		hasHintForPlan2:  true,
 		canGeneratePlan2: true,
-	}.Init(ctx)
-	mockDS := mockDataSource{}.Init(ctx)
+	}.Init(ctx.GetPlanCtx())
+	mockDS := logicalop.MockDataSource{}.Init(ctx.GetPlanCtx())
 	mockPlan0.SetChildren(mockDS)
 
 	col0 := &expression.Column{UniqueID: 1}
@@ -209,12 +269,12 @@ func TestHintCannotFitProperty(t *testing.T) {
 		SortItems:      items,
 		CanAddEnforcer: true,
 	}
-	task, _, err := mockPlan0.findBestTask(prop0, &PlanCounterDisabled, defaultPhysicalOptimizeOption())
+	task, err := physicalop.FindBestTask(mockPlan0, prop0)
 	require.NoError(t, err)
-	require.False(t, task.invalid())
-	_, enforcedSort := task.plan().(*PhysicalSort)
+	require.False(t, task.Invalid())
+	_, enforcedSort := task.Plan().(*physicalop.PhysicalSort)
 	require.True(t, enforcedSort)
-	plan2 := task.plan().Children()[0]
+	plan2 := task.Plan().Children()[0]
 	mockPhysicalPlan, ok := plan2.(*mockPhysicalPlan4Test)
 	require.True(t, ok)
 	require.Equal(t, 2, mockPhysicalPlan.planType)
@@ -225,12 +285,12 @@ func TestHintCannotFitProperty(t *testing.T) {
 		SortItems:      items,
 		CanAddEnforcer: false,
 	}
-	task, _, err = mockPlan0.findBestTask(prop1, &PlanCounterDisabled, defaultPhysicalOptimizeOption())
+	task, err = physicalop.FindBestTask(mockPlan0, prop1)
 	require.NoError(t, err)
-	require.False(t, task.invalid())
-	_, enforcedSort = task.plan().(*PhysicalSort)
+	require.False(t, task.Invalid())
+	_, enforcedSort = task.Plan().(*physicalop.PhysicalSort)
 	require.True(t, enforcedSort)
-	plan2 = task.plan().Children()[0]
+	plan2 = task.Plan().Children()[0]
 	mockPhysicalPlan, ok = plan2.(*mockPhysicalPlan4Test)
 	require.True(t, ok)
 	require.Equal(t, 2, mockPhysicalPlan.planType)
@@ -246,12 +306,12 @@ func TestHintCannotFitProperty(t *testing.T) {
 		canGeneratePlan2: false,
 	}.Init(ctx)
 	mockPlan1.SetChildren(mockDS)
-	task, _, err = mockPlan1.findBestTask(prop2, &PlanCounterDisabled, defaultPhysicalOptimizeOption())
+	task, err = physicalop.FindBestTask(mockPlan1, prop2)
 	require.NoError(t, err)
-	require.False(t, task.invalid())
+	require.False(t, task.Invalid())
 	require.Equal(t, uint16(1), ctx.GetSessionVars().StmtCtx.WarningCount())
 	// Because physicalPlan1 can match the property, so we should get it.
-	mockPhysicalPlan, ok = task.plan().(*mockPhysicalPlan4Test)
+	mockPhysicalPlan, ok = task.Plan().(*mockPhysicalPlan4Test)
 	require.True(t, ok)
 	require.Equal(t, 1, mockPhysicalPlan.planType)
 
@@ -262,12 +322,82 @@ func TestHintCannotFitProperty(t *testing.T) {
 		SortItems:      items,
 		CanAddEnforcer: true,
 	}
-	task, _, err = mockPlan1.findBestTask(prop3, &PlanCounterDisabled, defaultPhysicalOptimizeOption())
+	task, err = physicalop.FindBestTask(mockPlan1, prop3)
 	require.NoError(t, err)
-	require.False(t, task.invalid())
+	require.False(t, task.Invalid())
 	require.Equal(t, uint16(1), ctx.GetSessionVars().StmtCtx.WarningCount())
 	// Because physicalPlan1 can match the property, so we don't need to enforce a sort.
-	mockPhysicalPlan, ok = task.plan().(*mockPhysicalPlan4Test)
+	mockPhysicalPlan, ok = task.Plan().(*mockPhysicalPlan4Test)
 	require.True(t, ok)
 	require.Equal(t, 1, mockPhysicalPlan.planType)
+}
+
+func testMissingStatsIndexVsFullScan(t *testing.T) {
+	ctx := coretestsdk.MockContext()
+	defer domain.GetDomain(ctx).StatsHandle().Close()
+	prop := property.NewPhysicalProperty(property.RootTaskType, nil, false, 0, false)
+	// The table has statistics, but index 1 does not.
+	stats := &statistics.Table{ColAndIdxExistenceMap: statistics.NewColAndIndexExistenceMapWithoutSize()}
+	idx := &candidatePath{
+		path:              &util.AccessPath{Index: &model.IndexInfo{ID: 1}, Ranges: make(ranger.Ranges, 1), CountAfterAccess: 10},
+		accessCondsColMap: map[int64]int{1: -1, 2: -1},
+		eqOrInCount:       2,
+	}
+	tbl := &candidatePath{
+		path:              &util.AccessPath{IsIntHandlePath: true, Ranges: ranger.FullIntRange(false), IsSingleScan: true, CountAfterAccess: 1000},
+		accessCondsColMap: map[int64]int{},
+	}
+	// The missing-statistics index with 2 equal predicates wins over a full table scan,
+	// independent of tidb_opt_prefer_range_scan.
+	for _, preferRange := range []bool{false, true} {
+		ctx.GetSessionVars().SetAllowPreferRangeScan(preferRange)
+		result, missingStats := compareCandidates(ctx.GetPlanCtx(), stats, prop, idx, tbl)
+		require.Equal(t, 1, result, "preferRange=%v", preferRange)
+		require.True(t, missingStats)
+		result, _ = compareCandidates(ctx.GetPlanCtx(), stats, prop, tbl, idx)
+		require.Equal(t, -1, result, "reversed: preferRange=%v", preferRange)
+	}
+
+	// A non-covering missing-statistics index estimated to read most of the table must not prune
+	// the full table scan, see https://github.com/pingcap/tidb/issues/72561.
+	broad := &candidatePath{
+		path:              &util.AccessPath{Index: &model.IndexInfo{ID: 1}, Ranges: make(ranger.Ranges, 900), CountAfterAccess: 900},
+		accessCondsColMap: map[int64]int{1: -1, 2: -1},
+		eqOrInCount:       2,
+	}
+	result, missingStats := compareCandidates(ctx.GetPlanCtx(), stats, prop, broad, tbl)
+	require.Equal(t, 0, result)
+	require.False(t, missingStats)
+	result, _ = compareCandidates(ctx.GetPlanCtx(), stats, prop, tbl, broad)
+	require.Equal(t, 0, result)
+	// The threshold is the default selectivity (0.8) of the table.
+	broad.path.CountAfterAccess = 800
+	result, _ = compareCandidates(ctx.GetPlanCtx(), stats, prop, broad, tbl)
+	require.Equal(t, 0, result)
+	broad.path.CountAfterAccess = 799
+	result, missingStats = compareCandidates(ctx.GetPlanCtx(), stats, prop, broad, tbl)
+	require.Equal(t, 1, result)
+	require.True(t, missingStats)
+	// A covering index has no table lookups, so it may still prune the full table scan.
+	broad.path.CountAfterAccess = 900
+	broad.path.IsSingleScan = true
+	result, missingStats = compareCandidates(ctx.GetPlanCtx(), stats, prop, broad, tbl)
+	require.Equal(t, 1, result)
+	require.True(t, missingStats)
+
+	// A non-covering index with more ranges than tidb_opt_range_max_count is a broad lookup, even
+	// if its estimate is small. Zero disables the range count check.
+	broad.path.IsSingleScan = false
+	broad.path.CountAfterAccess = 10
+	require.False(t, isBroadIndexLookup(broad, 1000, 1000))
+	require.True(t, isBroadIndexLookup(broad, 1000, 899))
+	require.False(t, isBroadIndexLookup(broad, 1000, 0))
+	require.True(t, canPseudoWinnerPrune(broad, tbl, 1000))
+	require.False(t, canPseudoWinnerPrune(broad, tbl, 899))
+	// Against another index, the winner may always prune.
+	require.True(t, canPseudoWinnerPrune(broad, idx, 899))
+	ctx.GetSessionVars().RangeMaxCount = 899
+	result, missingStats = compareCandidates(ctx.GetPlanCtx(), stats, prop, broad, tbl)
+	require.Equal(t, 0, result)
+	require.False(t, missingStats)
 }

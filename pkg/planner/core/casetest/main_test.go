@@ -30,13 +30,14 @@ func TestMain(m *testing.M) {
 	testsetup.SetupForCommonTest()
 
 	flag.Parse()
-	testDataMap.LoadTestSuiteData("testdata", "plan_normalized_suite")
-	testDataMap.LoadTestSuiteData("testdata", "stats_suite")
-	testDataMap.LoadTestSuiteData("testdata", "integration_suite")
-	testDataMap.LoadTestSuiteData("testdata", "json_plan_suite")
+	testDataMap.LoadTestSuiteData("testdata", "plan_normalized_suite", true)
+	testDataMap.LoadTestSuiteData("testdata", "stats_suite", true)
+	testDataMap.LoadTestSuiteData("testdata", "integration_suite", true)
+	testDataMap.LoadTestSuiteData("testdata", "json_plan_suite", true)
 
 	opts := []goleak.Option{
 		goleak.IgnoreTopFunction("github.com/golang/glog.(*fileSink).flushDaemon"),
+		goleak.IgnoreTopFunction("github.com/bazelbuild/rules_go/go/tools/bzltestutil.RegisterTimeoutHandler.func1"),
 		goleak.IgnoreTopFunction("github.com/lestrrat-go/httprc.runFetchWorker"),
 		goleak.IgnoreTopFunction("go.etcd.io/etcd/client/pkg/v3/logutil.(*MergeLogger).outputLoop"),
 		goleak.IgnoreTopFunction("gopkg.in/natefinch/lumberjack%2ev2.(*Logger).millRun"),

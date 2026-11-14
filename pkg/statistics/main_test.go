@@ -47,6 +47,7 @@ func TestMain(m *testing.M) {
 
 	opts := []goleak.Option{
 		goleak.IgnoreTopFunction("github.com/golang/glog.(*fileSink).flushDaemon"),
+		goleak.IgnoreTopFunction("github.com/bazelbuild/rules_go/go/tools/bzltestutil.RegisterTimeoutHandler.func1"),
 		goleak.IgnoreTopFunction("github.com/lestrrat-go/httprc.runFetchWorker"),
 		goleak.IgnoreTopFunction("go.etcd.io/etcd/client/pkg/v3/logutil.(*MergeLogger).outputLoop"),
 		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
@@ -70,6 +71,7 @@ func TestStatistics(t *testing.T) {
 	t.Run("SubTestSketch", SubTestSketch())
 	t.Run("SubTestSketchProtoConversion", SubTestSketchProtoConversion())
 	t.Run("SubTestFMSketchCoding", SubTestFMSketchCoding())
+	t.Run("SubTestSampledNDV", SubTestSampledNDV())
 
 	// statistics_test.go
 	t.Run("SubTestColumnRange", SubTestColumnRange())
@@ -86,8 +88,8 @@ func createTestStatisticsSamples(t *testing.T) *testStatisticsSamples {
 
 	s.count = 100000
 	samples := make([]*SampleItem, 10000)
-	for i := 0; i < len(samples); i++ {
-		samples[i] = &SampleItem{}
+	for i := range samples {
+		samples[i] = &SampleItem{Value: types.Datum{}}
 	}
 	start := 1000
 	samples[0].Value.SetInt64(0)
@@ -137,7 +139,7 @@ func createTestStatisticsSamples(t *testing.T) *testStatisticsSamples {
 		cursor: 0,
 	}
 	pk.setFields(mysql.TypeLonglong)
-	for i := 0; i < rc.count; i++ {
+	for i := range rc.count {
 		pk.data[i].SetInt64(int64(i))
 	}
 	s.pk = pk

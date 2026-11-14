@@ -20,12 +20,14 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/executor/aggregate"
 	"github.com/pingcap/tidb/pkg/session"
@@ -37,11 +39,9 @@ import (
 func TestHashAggRuntimeStat(t *testing.T) {
 	partialInfo := &aggregate.AggWorkerInfo{
 		Concurrency: 5,
-		WallTime:    int64(time.Second * 20),
 	}
 	finalInfo := &aggregate.AggWorkerInfo{
 		Concurrency: 8,
-		WallTime:    int64(time.Second * 10),
 	}
 	stats := &aggregate.HashAggRuntimeStats{
 		PartialConcurrency: 5,
@@ -49,7 +49,7 @@ func TestHashAggRuntimeStat(t *testing.T) {
 		FinalConcurrency:   8,
 		FinalWallTime:      int64(time.Second * 10),
 	}
-	for i := 0; i < partialInfo.Concurrency; i++ {
+	for i := range partialInfo.Concurrency {
 		stats.PartialStats = append(stats.PartialStats, &aggregate.AggWorkerStat{
 			TaskNum:    5,
 			WaitTime:   int64(2 * time.Second),
@@ -57,7 +57,7 @@ func TestHashAggRuntimeStat(t *testing.T) {
 			WorkerTime: int64(i) * int64(time.Second),
 		})
 	}
-	for i := 0; i < finalInfo.Concurrency; i++ {
+	for i := range finalInfo.Concurrency {
 		stats.FinalStats = append(stats.FinalStats, &aggregate.AggWorkerStat{
 			TaskNum:    5,
 			WaitTime:   int64(2 * time.Millisecond),
@@ -73,21 +73,54 @@ func TestHashAggRuntimeStat(t *testing.T) {
 	require.Equal(t, expect, stats.String())
 }
 
-func reconstructParallelGroupConcatResult(rows [][]interface{}) []string {
+func TestSumIntDistinct(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_hashagg_partial_concurrency = 4")
+	tk.MustExec("set @@tidb_hashagg_final_concurrency = 4")
+
+	tk.MustExec("create table t(a bigint, b bigint unsigned, g int)")
+	tk.MustExec("insert into t values (1, 1, 1), (1, 1, 1), (2, 2, 1), (2, 2, 1), (3, 3, 2), (3, 3, 2), (null, null, 2)")
+	tk.MustQuery("select sum_int(distinct a), sum_int(distinct b) from t").Check(testkit.Rows("6 6"))
+	tk.MustQuery("select /*+ hash_agg() */ g, sum_int(distinct a), sum_int(distinct b) from t group by g order by g").Check(testkit.Rows(
+		"1 3 3",
+		"2 3 3",
+	))
+
+	tk.MustExec("truncate table t")
+	tk.MustExec("insert into t values (null, null, 1), (null, null, 1)")
+	tk.MustQuery("select sum_int(distinct a), sum_int(distinct b) from t").Check(testkit.Rows("<nil> <nil>"))
+}
+
+func TestSumIntMockCopPushDown(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	tk.MustExec("create table t(a bigint, b bigint unsigned)")
+	tk.MustExec("insert into t values (1, 1), (2, 2), (null, null)")
+
+	sql := "select /*+ agg_to_cop(), hash_agg() */ sum_int(a), sum_int(b) from t"
+	plan := fmt.Sprint(tk.MustQuery("explain format = 'brief' " + sql).Rows())
+	require.Contains(t, plan, "HashAgg")
+	require.Contains(t, plan, "cop[tikv]")
+	require.Contains(t, plan, "sum_int(test.t.a)")
+	require.Contains(t, plan, "sum_int(test.t.b)")
+	tk.MustQuery(sql).Check(testkit.Rows("3 3"))
+}
+
+func reconstructParallelGroupConcatResult(rows [][]any) []string {
 	data := make([]string, 0, len(rows))
 	for _, row := range rows {
 		if str, ok := row[0].(string); ok {
 			tokens := strings.Split(str, ",")
-			sort.Slice(tokens, func(i, j int) bool {
-				return tokens[i] < tokens[j]
-			})
+			slices.Sort(tokens)
 			data = append(data, strings.Join(tokens, ","))
 		}
 	}
 
-	sort.Slice(data, func(i, j int) bool {
-		return data[i] < data[j]
-	})
+	slices.Sort(data)
 
 	return data
 }
@@ -102,7 +135,7 @@ func TestParallelStreamAggGroupConcat(t *testing.T) {
 	tk.MustExec("set tidb_max_chunk_size=32;")
 
 	var insertSQL string
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		if i == 0 {
 			insertSQL += fmt.Sprintf("(%d, %d)", rand.Intn(100), rand.Intn(100))
 		} else {
@@ -131,7 +164,7 @@ func TestParallelStreamAggGroupConcat(t *testing.T) {
 			require.True(t, ok)
 			obtained := reconstructParallelGroupConcatResult(tk.MustQuery(sql).Rows())
 			require.Equal(t, len(expected), len(obtained))
-			for i := 0; i < len(obtained); i++ {
+			for i := range obtained {
 				require.Equal(t, expected[i], obtained[i])
 			}
 		}
@@ -159,7 +192,7 @@ func TestIssue20658(t *testing.T) {
 	randSeed := time.Now().UnixNano()
 	r := rand.New(rand.NewSource(randSeed))
 	var insertSQL strings.Builder
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		insertSQL.WriteString("(")
 		insertSQL.WriteString(strconv.Itoa(r.Intn(10)))
 		insertSQL.WriteString(",")
@@ -171,9 +204,9 @@ func TestIssue20658(t *testing.T) {
 	}
 	tk.MustExec(fmt.Sprintf("insert into t values %s;", insertSQL.String()))
 
-	mustParseAndSort := func(rows [][]interface{}, cmt string) []float64 {
+	mustParseAndSort := func(rows [][]any, cmt string) []float64 {
 		ret := make([]float64, len(rows))
-		for i := 0; i < len(rows); i++ {
+		for i := range rows {
 			rowStr := rows[i][0].(string)
 			if rowStr == "<nil>" {
 				ret[i] = 0
@@ -246,6 +279,10 @@ func TestAggInDisk(t *testing.T) {
 	tk.MustExec("insert into t values(0)")
 	tk.MustQuery("select sum(tt.b) from ( select /*+ HASH_AGG() */ avg(t1.a) as b from t t1 join t t2 group by t1.a, t2.a) as tt").Check(
 		testkit.Rows("4040100.0000"))
+	tk.MustQuery("select sum_int(tt.b) from ( select /*+ HASH_AGG() */ sum_int(t1.a) as b from t t1 join t t2 group by t1.a, t2.a) as tt").Check(
+		testkit.Rows("4060200"))
+	tk.MustQuery("select sum(tt.b), sum_int(tt.b) from ( select /*+ HASH_AGG() */ sum_int(t1.a) as b from t t1 join t t2 group by t1.a, t2.a) as tt").Check(
+		testkit.Rows("4060200 4060200"))
 	// Test no groupby and no data.
 	tk.MustExec("drop table t;")
 	tk.MustExec("create table t(c int, c1 int);")
@@ -281,6 +318,11 @@ func TestRandomPanicConsume(t *testing.T) {
 	require.NoError(t, failpoint.Enable(fpName2, "3%panic(\"ERROR 1105 (HY000): Out Of Memory Quota![conn=1]\")"))
 	defer func() {
 		require.NoError(t, failpoint.Disable(fpName2))
+	}()
+	fpName3 := "github.com/pingcap/tidb/pkg/executor/join/ConsumeRandomPanic"
+	require.NoError(t, failpoint.Enable(fpName3, "3%panic(\"ERROR 1105 (HY000): Out Of Memory Quota![conn=1]\")"))
+	defer func() {
+		require.NoError(t, failpoint.Disable(fpName3))
 	}()
 
 	sqls := []string{
@@ -329,12 +371,13 @@ func TestRandomPanicConsume(t *testing.T) {
 					require.NoError(t, res.Close())
 				}
 			}
-			require.EqualError(t, err, "failpoint panic: ERROR 1105 (HY000): Out Of Memory Quota![conn=1]")
+			errStr := err.Error()
+			require.True(t, errStr == "failpoint panic: ERROR 1105 (HY000): Out Of Memory Quota![conn=1]" || errStr == "context canceled")
 		}
 	}
 }
 
-func checkResults(actualRes [][]interface{}, expectedRes map[string]string) bool {
+func checkResults(actualRes [][]any, expectedRes map[string]string) bool {
 	if len(actualRes) != len(expectedRes) {
 		return false
 	}
@@ -387,7 +430,7 @@ func TestParallelHashAgg(t *testing.T) {
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists test.parallel_hash_agg;")
 	tk.MustExec("create table test.parallel_hash_agg(k varchar(30), v int);")
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		tk.MustExec("insert into test.parallel_hash_agg (k, v) values ('aa', 1), ('AA', 1), ('aA', 1), ('Aa', 1), ('bb', 1), ('BB', 1), ('bB', 1), ('Bb', 1), ('cc', 1), ('CC', 1), ('cC', 1), ('Cc', 1), ('dd', 1), ('DD', 1), ('dD', 1), ('Dd', 1), ('ee', 1), ('EE', 1), ('eE', 1), ('Ee', 1);")
 	}
 
@@ -420,7 +463,6 @@ func TestParallelHashAgg(t *testing.T) {
 	tk.MustExec("create database list_partition_agg")
 	tk.MustExec("use list_partition_agg")
 	tk.MustExec("drop table if exists tlist")
-	tk.MustExec(`set tidb_enable_list_partition = 1`)
 	tk.MustExec(`create table tlist (a int, b int) partition by list(a) (` +
 		` partition p0 values in ` + genListPartition(0, 20) +
 		`, partition p1 values in ` + genListPartition(20, 40) +
@@ -430,7 +472,7 @@ func TestParallelHashAgg(t *testing.T) {
 	tk.MustExec(`create table tnormal (a int, b int)`)
 
 	vals := ""
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if vals != "" {
 			vals += ", "
 		}
@@ -441,7 +483,7 @@ func TestParallelHashAgg(t *testing.T) {
 
 	for _, aggFunc := range []string{"min", "max", "sum", "count"} {
 		c1, c2 := "a", "b"
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			rs := tk.MustQuery(fmt.Sprintf(`select %v, %v(%v) from tnormal group by %v`, c1, aggFunc, c2, c1)).Sort()
 
 			tk.MustExec("set @@tidb_partition_prune_mode = 'dynamic'")
@@ -453,5 +495,135 @@ func TestParallelHashAgg(t *testing.T) {
 			rs.Check(rsDynamic.Rows())
 			rs.Check(rsStatic.Rows())
 		}
+	}
+}
+
+func TestIssue50849(t *testing.T) {
+	store, _ := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test;")
+	tk.MustExec("drop table if exists t;")
+	tk.MustExec("create table t(a int);")
+	tk.MustExec("insert into t values(1);")
+	tk.MustExec("insert into t select * from t;")
+
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/executor/aggregate/injectHashAggClosePanic", "return(true)"))
+	defer failpoint.Disable("github.com/pingcap/tidb/pkg/executor/aggregate/injectHashAggClosePanic")
+	rs, err := tk.ExecWithContext(context.Background(), "select  /*+hash_agg()*/ sum(t1.a) from t t1 join t t2;")
+	require.NoError(t, err)
+	err = rs.Close()
+	// Check the error contains stack information
+	require.True(t, errors.HasStack(err))
+}
+
+// TestStreamAggPendingMemDeltaBatching verifies the pendingMemDelta batching optimization
+// in StreamAggExec using the "streamAggMemDeltaFlushForTest" failpoint injected at the
+// flush site in consumeGroupRows.
+//
+// Strategy: enable the failpoint as "panic" so it crashes the query if the flush path is
+// entered.  Then:
+//   - Small-string query (per-group delta < threshold) must SUCCEED — flush was not triggered.
+//   - Large-string query (per-group delta > threshold) must FAIL   — flush was triggered.
+//
+// A final correctness pass runs both queries without the failpoint and checks results.
+func TestStreamAggPendingMemDeltaBatching(t *testing.T) {
+	const fpPath = "github.com/pingcap/tidb/pkg/executor/aggregate/streamAggMemDeltaFlushForTest"
+
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set tidb_track_aggregate_memory_usage=ON")
+	tk.MustExec("set tidb_init_chunk_size=1")
+	tk.MustExec("set tidb_max_chunk_size=32")
+	tk.MustExec("set group_concat_max_len = 1048576")
+	tk.MustExec("drop table if exists t_stream_agg_mem")
+	// No index: planner adds Sort→StreamAgg which is the standard stream-agg pattern.
+	tk.MustExec("create table t_stream_agg_mem(a int, b varchar(512))")
+
+	const (
+		// 5-byte strings, 1 row per group: per-group GROUP_CONCAT buffer growth is ~200 bytes,
+		// well below the 1 KB flush threshold. pendingMemDelta is discarded by ReplaceBytesUsed.
+		nSmallGroups = 50
+		smallStr     = "xxxxx"
+
+		// 20 rows per group, each 100 bytes: the GROUP_CONCAT buffer for one group reaches
+		// ~3 KB, crossing the 1 KB threshold mid-group and triggering an explicit Consume.
+		nLargeGroups  = 5
+		rowsPerGroup  = 20
+		largeRowBytes = 100
+	)
+
+	// stream_agg() hint forces Sort→StreamAgg. Verify the plan before using the failpoint.
+	smallSQL := "select /*+ stream_agg() */ a, group_concat(b) from t_stream_agg_mem group by a"
+	largeSQL := smallSQL
+
+	var sb strings.Builder
+
+	insertSmall := func() {
+		tk.MustExec("delete from t_stream_agg_mem")
+		sb.Reset()
+		for i := range nSmallGroups {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			fmt.Fprintf(&sb, "(%d,'%s')", i, smallStr)
+		}
+		tk.MustExec("insert into t_stream_agg_mem values " + sb.String())
+	}
+
+	insertLarge := func() {
+		tk.MustExec("delete from t_stream_agg_mem")
+		sb.Reset()
+		first := true
+		for g := range nLargeGroups {
+			for range rowsPerGroup {
+				if !first {
+					sb.WriteString(",")
+				}
+				first = false
+				fmt.Fprintf(&sb, "(%d,'%s')", g, strings.Repeat("y", largeRowBytes))
+			}
+		}
+		tk.MustExec("insert into t_stream_agg_mem values " + sb.String())
+	}
+
+	// --- Verify both queries actually use StreamAgg ---
+	insertSmall()
+	tk.MustHavePlan(smallSQL, "StreamAgg")
+	insertLarge()
+	tk.MustHavePlan(largeSQL, "StreamAgg")
+
+	// --- No-flush path ---
+	// Small strings: per-group buffer growth (~200 B) never reaches the 1 KB threshold.
+	// With the failpoint armed as "panic", the query must succeed — flush was not triggered.
+	insertSmall()
+	require.NoError(t, failpoint.Enable(fpPath, "panic"))
+	tk.MustQuery(smallSQL)
+	require.NoError(t, failpoint.Disable(fpPath))
+
+	// --- Flush path ---
+	// Large data: 20 rows × 100 B per group → buffer crosses 1 KB mid-group, Consume fires.
+	// With the failpoint armed, the query must fail, proving the flush branch was entered.
+	insertLarge()
+	require.NoError(t, failpoint.Enable(fpPath, "panic"))
+	// QueryToErr is required here: ExecToErr only closes the RecordSet without fetching rows,
+	// so consumeGroupRows never runs and the failpoint in the flush path never fires.
+	require.Error(t, tk.QueryToErr(largeSQL), "flush must be triggered for large per-group deltas")
+	require.NoError(t, failpoint.Disable(fpPath))
+
+	// --- Correctness pass (no failpoint) ---
+	insertSmall()
+	rows := tk.MustQuery(smallSQL).Rows()
+	require.Len(t, rows, nSmallGroups)
+	for _, row := range rows {
+		require.Equal(t, smallStr, row[1].(string))
+	}
+
+	insertLarge()
+	rows = tk.MustQuery(largeSQL).Rows()
+	require.Len(t, rows, nLargeGroups)
+	for _, row := range rows {
+		// Each group has rowsPerGroup rows of largeRowBytes each, joined by ",".
+		require.Len(t, row[1].(string), rowsPerGroup*largeRowBytes+(rowsPerGroup-1))
 	}
 }

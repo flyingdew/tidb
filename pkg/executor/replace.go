@@ -24,10 +24,12 @@ import (
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/table/tables"
 	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/execdetails"
 	"github.com/pingcap/tidb/pkg/util/memory"
 )
 
@@ -39,6 +41,9 @@ type ReplaceExec struct {
 
 // Close implements the Executor Close interface.
 func (e *ReplaceExec) Close() error {
+	if e.writeStats != nil {
+		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.writeStats)
+	}
 	e.setMessage()
 	if e.RuntimeStats() != nil && e.stats != nil {
 		defer e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.ID(), e.stats)
@@ -51,6 +56,10 @@ func (e *ReplaceExec) Close() error {
 
 // Open implements the Executor Open interface.
 func (e *ReplaceExec) Open(ctx context.Context) error {
+	e.writeStats = nil
+	if e.RuntimeStats() != nil {
+		e.writeStats = &execdetails.WriteRuntimeStats{}
+	}
 	e.memTracker = memory.NewTracker(e.ID(), -1)
 	e.memTracker.AttachTo(e.Ctx().GetSessionVars().StmtCtx.MemTracker)
 
@@ -62,7 +71,7 @@ func (e *ReplaceExec) Open(ctx context.Context) error {
 }
 
 // replaceRow removes all duplicate rows for one row, then inserts it.
-func (e *ReplaceExec) replaceRow(ctx context.Context, r toBeCheckedRow) error {
+func (e *ReplaceExec) replaceRow(ctx context.Context, r toBeCheckedRow, dupKeyCheck table.DupKeyCheckMode) error {
 	txn, err := e.Ctx().Txn(true)
 	if err != nil {
 		return err
@@ -105,7 +114,7 @@ func (e *ReplaceExec) replaceRow(ctx context.Context, r toBeCheckedRow) error {
 	}
 
 	// No duplicated rows now, insert the row.
-	err = e.addRecord(ctx, r.row)
+	err = e.addRecord(ctx, r.row, dupKeyCheck)
 	if err != nil {
 		return err
 	}
@@ -120,7 +129,7 @@ func (e *ReplaceExec) replaceRow(ctx context.Context, r toBeCheckedRow) error {
 //  3. error: the error.
 func (e *ReplaceExec) removeIndexRow(ctx context.Context, txn kv.Transaction, r toBeCheckedRow) (rowUnchanged, foundDupKey bool, err error) {
 	for _, uk := range r.uniqueKeys {
-		_, handle, err := tables.FetchDuplicatedHandle(ctx, uk.newKey, true, txn, e.Table.Meta().ID, uk.commonHandle)
+		handle, err := tables.FetchDuplicatedHandle(ctx, uk.newKey, txn)
 		if err != nil {
 			return false, false, err
 		}
@@ -161,7 +170,6 @@ func (e *ReplaceExec) exec(ctx context.Context, newRows [][]types.Datum) error {
 	if err != nil {
 		return err
 	}
-	txnSize := txn.Size()
 
 	if e.collectRuntimeStatsEnabled() {
 		if snapshot := txn.GetSnapshot(); snapshot != nil {
@@ -180,15 +188,18 @@ func (e *ReplaceExec) exec(ctx context.Context, newRows [][]types.Datum) error {
 	if e.stats != nil {
 		e.stats.Prefetch = time.Since(prefetchStart)
 	}
-	e.Ctx().GetSessionVars().StmtCtx.AddRecordRows(uint64(len(newRows)))
+	sessionVars := e.Ctx().GetSessionVars()
+	sessionVars.StmtCtx.AddRecordRows(uint64(len(newRows)))
+	recordWriteCPUWork(e.writeStats, e.Table, len(newRows))
+	// TODO: seems we can optimize it to `DupKeyCheckSkip` because all conflict rows are deleted in previous steps.
+	dupKeyCheck := optimizeDupKeyCheckForNormalInsert(sessionVars, txn)
 	for _, r := range toBeCheckedRows {
-		err = e.replaceRow(ctx, r)
+		err = e.replaceRow(ctx, r, dupKeyCheck)
 		if err != nil {
 			return err
 		}
 	}
-	e.memTracker.Consume(int64(txn.Size() - txnSize))
-	return nil
+	return txn.MayFlush()
 }
 
 // Next implements the Executor Next interface.

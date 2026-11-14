@@ -19,7 +19,6 @@ import (
 	"strconv"
 
 	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/model"
 )
 
 %}
@@ -31,7 +30,9 @@ import (
 	hint    *ast.TableOptimizerHint
 	hints []*ast.TableOptimizerHint
 	table 	ast.HintTable
-	modelIdents []model.CIStr
+	modelIdents []ast.CIStr
+    leadingList *ast.LeadingList
+    leadingElement interface{} // Modified: Represents either *ast.HintTable or *ast.LeadingList
 }
 
 %token	<number>
@@ -50,6 +51,9 @@ import (
 
 	/*yy:token "'%c'" */
 	hintStringLit
+
+	/* SET_VAR-only decimal/float literal. Integer values still use hintIntLit. */
+	hintNumericLit
 
 	/* MySQL 8.0 hint names */
 	hintJoinFixedOrder      "JOIN_FIXED_ORDER"
@@ -80,10 +84,12 @@ import (
 	hintSetVar              "SET_VAR"
 	hintResourceGroup       "RESOURCE_GROUP"
 	hintQBName              "QB_NAME"
+	hintHypoIndex           "HYPO_INDEX"
 
 	/* TiDB hint names */
 	hintAggToCop              "AGG_TO_COP"
 	hintIgnorePlanCache       "IGNORE_PLAN_CACHE"
+	hintWriteSlowLog          "WRITE_SLOW_LOG"
 	hintHashAgg               "HASH_AGG"
 	hintMpp1PhaseAgg          "MPP_1PHASE_AGG"
 	hintMpp2PhaseAgg          "MPP_2PHASE_AGG"
@@ -112,6 +118,8 @@ import (
 	hintUseIndex              "USE_INDEX"
 	hintOrderIndex            "ORDER_INDEX"
 	hintNoOrderIndex          "NO_ORDER_INDEX"
+	hintIndexLookUpPushDown   "INDEX_LOOKUP_PUSHDOWN"
+	hintNoIndexLookUpPushDown "NO_INDEX_LOOKUP_PUSHDOWN"
 	hintUsePlanCache          "USE_PLAN_CACHE"
 	hintUseToja               "USE_TOJA"
 	hintTimeRange             "TIME_RANGE"
@@ -123,6 +131,7 @@ import (
 	hintLeading               "LEADING"
 	hintSemiJoinRewrite       "SEMI_JOIN_REWRITE"
 	hintNoDecorrelate         "NO_DECORRELATE"
+	hintTiFlashLMFilter       "TIFLASH_LM_FILTER"
 
 	/* Other keywords */
 	hintOLAP            "OLAP"
@@ -185,6 +194,12 @@ import (
 	PartitionList    "partition name list in optimizer hint"
 	PartitionListOpt "optional partition name list in optimizer hint"
 
+%type	<leadingList>
+	LeadingTableList "leading table list"
+
+%type	<leadingElement>
+	LeadingTableElement "leading element (table or list)"
+
 
 %start	Start
 
@@ -239,7 +254,28 @@ TableOptimizerHintOpt:
 |	SupportedTableLevelOptimizerHintName '(' HintTableListOpt ')'
 	{
 		h := $3
-		h.HintName = model.NewCIStr($1)
+		h.HintName = ast.NewCIStr($1)
+		$$ = h
+	}
+|	"LEADING" '(' QueryBlockOpt LeadingTableList ')'
+	{
+		h := &ast.TableOptimizerHint{
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
+			HintData: $4,
+		}
+		// For LEADING hints we need to maintain two views of the tables:
+		// h.HintData:
+		//   - Stores the structured AST node (LeadingList).
+		//   - Preserves the nesting and order information of LEADING(...),
+		//
+		// h.Tables:
+		//   - Stores a flat slice of all HintTable elements inside the LeadingList.
+		//   - Only used for initialization.
+		if leadingList, ok := h.HintData.(*ast.LeadingList); ok {
+			// be compatible with the prior flatten writing style
+			h.Tables = ast.FlattenLeadingList(leadingList)
+		}
 		$$ = h
 	}
 |	UnsupportedIndexLevelOptimizerHintName '(' HintIndexList ')'
@@ -250,7 +286,7 @@ TableOptimizerHintOpt:
 |	SupportedIndexLevelOptimizerHintName '(' HintIndexList ')'
 	{
 		h := $3
-		h.HintName = model.NewCIStr($1)
+		h.HintName = ast.NewCIStr($1)
 		$$ = h
 	}
 |	SubqueryOptimizerHintName '(' QueryBlockOpt SubqueryStrategiesOpt ')'
@@ -261,23 +297,23 @@ TableOptimizerHintOpt:
 |	"MAX_EXECUTION_TIME" '(' QueryBlockOpt hintIntLit ')'
 	{
 		$$ = &ast.TableOptimizerHint{
-			HintName: model.NewCIStr($1),
-			QBName:   model.NewCIStr($3),
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
 			HintData: $4,
 		}
 	}
 |	"NTH_PLAN" '(' QueryBlockOpt hintIntLit ')'
 	{
 		$$ = &ast.TableOptimizerHint{
-			HintName: model.NewCIStr($1),
-			QBName:   model.NewCIStr($3),
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
 			HintData: int64($4),
 		}
 	}
 |	"SET_VAR" '(' Identifier '=' Value ')'
 	{
 		$$ = &ast.TableOptimizerHint{
-			HintName: model.NewCIStr($1),
+			HintName: ast.NewCIStr($1),
 			HintData: ast.HintSetVar{
 				VarName: $3,
 				Value:   $5,
@@ -287,22 +323,22 @@ TableOptimizerHintOpt:
 |	"RESOURCE_GROUP" '(' Identifier ')'
 	{
 		$$ = &ast.TableOptimizerHint{
-			HintName: model.NewCIStr($1),
+			HintName: ast.NewCIStr($1),
 			HintData: $3,
 		}
 	}
 |	"QB_NAME" '(' Identifier ')'
 	{
 		$$ = &ast.TableOptimizerHint{
-			HintName: model.NewCIStr($1),
-			QBName:   model.NewCIStr($3),
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
 		}
 	}
 |	"QB_NAME" '(' Identifier ',' ViewNameList ')'
 	{
 		$$ = &ast.TableOptimizerHint{
-			HintName: model.NewCIStr($1),
-			QBName:   model.NewCIStr($3),
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
 			Tables:   $5.Tables,
 		}
 	}
@@ -311,12 +347,12 @@ TableOptimizerHintOpt:
 		maxValue := uint64(math.MaxInt64) / $5
 		if $4 <= maxValue {
 			$$ = &ast.TableOptimizerHint{
-				HintName: model.NewCIStr($1),
+				HintName: ast.NewCIStr($1),
 				HintData: int64($4 * $5),
-				QBName:   model.NewCIStr($3),
+				QBName:   ast.NewCIStr($3),
 			}
 		} else {
-			yylex.AppendError(ErrWarnMemoryQuotaOverflow.GenWithStackByArgs(math.MaxInt64))
+			yylex.AppendError(ErrWarnMemoryQuotaOverflow.GenWithStackByArgs(math.MaxInt))
 			parser.lastErrorAsWarn()
 			$$ = nil
 		}
@@ -324,7 +360,7 @@ TableOptimizerHintOpt:
 |	"TIME_RANGE" '(' hintStringLit CommaOpt hintStringLit ')'
 	{
 		$$ = &ast.TableOptimizerHint{
-			HintName: model.NewCIStr($1),
+			HintName: ast.NewCIStr($1),
 			HintData: ast.HintTimeRange{
 				From: $3,
 				To:   $5,
@@ -334,23 +370,29 @@ TableOptimizerHintOpt:
 |	BooleanHintName '(' QueryBlockOpt HintTrueOrFalse ')'
 	{
 		h := $4
-		h.HintName = model.NewCIStr($1)
-		h.QBName = model.NewCIStr($3)
+		h.HintName = ast.NewCIStr($1)
+		h.QBName = ast.NewCIStr($3)
 		$$ = h
 	}
 |	NullaryHintName '(' QueryBlockOpt ')'
 	{
 		$$ = &ast.TableOptimizerHint{
-			HintName: model.NewCIStr($1),
-			QBName:   model.NewCIStr($3),
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
+		}
+	}
+|	"WRITE_SLOW_LOG"
+	{
+		$$ = &ast.TableOptimizerHint{
+			HintName: ast.NewCIStr($1),
 		}
 	}
 |	"QUERY_TYPE" '(' QueryBlockOpt HintQueryType ')'
 	{
 		$$ = &ast.TableOptimizerHint{
-			HintName: model.NewCIStr($1),
-			QBName:   model.NewCIStr($3),
-			HintData: model.NewCIStr($4),
+			HintName: ast.NewCIStr($1),
+			QBName:   ast.NewCIStr($3),
+			HintData: ast.NewCIStr($4),
 		}
 	}
 |	hintIdentifier '(' QueryBlockOpt hintIntLit ')'
@@ -379,8 +421,8 @@ StorageOptimizerHintOpt:
 	"READ_FROM_STORAGE" '(' QueryBlockOpt HintStorageTypeAndTableList ')'
 	{
 		hs := $4
-		name := model.NewCIStr($1)
-		qb := model.NewCIStr($3)
+		name := ast.NewCIStr($1)
+		qb := ast.NewCIStr($3)
 		for _, h := range hs {
 			h.HintName = name
 			h.QBName = qb
@@ -402,8 +444,30 @@ HintStorageTypeAndTable:
 	HintStorageType '[' HintTableList ']'
 	{
 		h := $3
-		h.HintData = model.NewCIStr($1)
+		h.HintData = ast.NewCIStr($1)
 		$$ = h
+	}
+
+LeadingTableList:
+	LeadingTableElement
+	{
+		$$ = &ast.LeadingList{Items: []interface{}{$1}}
+	}
+|	LeadingTableList ',' LeadingTableElement
+	{
+		$$ = $1
+		$$.Items = append($$.Items, $3)
+	}
+
+LeadingTableElement:
+	HintTable
+	{
+		tmp := $1
+		$$ = &tmp
+	}
+|	'(' LeadingTableList ')'
+	{
+		$$ = $2
 	}
 
 QueryBlockOpt:
@@ -432,11 +496,11 @@ PartitionListOpt:
 PartitionList:
 	Identifier
 	{
-		$$ = []model.CIStr{model.NewCIStr($1)}
+		$$ = []ast.CIStr{ast.NewCIStr($1)}
 	}
 |	PartitionList CommaOpt Identifier
 	{
-		$$ = append($1, model.NewCIStr($3))
+		$$ = append($1, ast.NewCIStr($3))
 	}
 
 /**
@@ -451,7 +515,7 @@ HintTableListOpt:
 |	QueryBlockOpt
 	{
 		$$ = &ast.TableOptimizerHint{
-			QBName: model.NewCIStr($1),
+			QBName: ast.NewCIStr($1),
 		}
 	}
 
@@ -460,7 +524,7 @@ HintTableList:
 	{
 		$$ = &ast.TableOptimizerHint{
 			Tables: []ast.HintTable{$2},
-			QBName: model.NewCIStr($1),
+			QBName: ast.NewCIStr($1),
 		}
 	}
 |	HintTableList ',' HintTable
@@ -474,17 +538,17 @@ HintTable:
 	Identifier QueryBlockOpt PartitionListOpt
 	{
 		$$ = ast.HintTable{
-			TableName:     model.NewCIStr($1),
-			QBName:        model.NewCIStr($2),
+			TableName:     ast.NewCIStr($1),
+			QBName:        ast.NewCIStr($2),
 			PartitionList: $3,
 		}
 	}
 |	Identifier '.' Identifier QueryBlockOpt PartitionListOpt
 	{
 		$$ = ast.HintTable{
-			DBName:        model.NewCIStr($1),
-			TableName:     model.NewCIStr($3),
-			QBName:        model.NewCIStr($4),
+			DBName:        ast.NewCIStr($1),
+			TableName:     ast.NewCIStr($3),
+			QBName:        ast.NewCIStr($4),
 			PartitionList: $5,
 		}
 	}
@@ -507,14 +571,14 @@ ViewName:
 	Identifier QueryBlockOpt
 	{
 		$$ = ast.HintTable{
-			TableName: model.NewCIStr($1),
-			QBName:    model.NewCIStr($2),
+			TableName: ast.NewCIStr($1),
+			QBName:    ast.NewCIStr($2),
 		}
 	}
 |	QueryBlockOpt
 	{
 		$$ = ast.HintTable{
-			QBName: model.NewCIStr($1),
+			QBName: ast.NewCIStr($1),
 		}
 	}
 
@@ -529,7 +593,7 @@ HintIndexList:
 	{
 		h := $4
 		h.Tables = []ast.HintTable{$2}
-		h.QBName = model.NewCIStr($1)
+		h.QBName = ast.NewCIStr($1)
 		$$ = h
 	}
 
@@ -544,13 +608,13 @@ IndexNameList:
 	Identifier
 	{
 		$$ = &ast.TableOptimizerHint{
-			Indexes: []model.CIStr{model.NewCIStr($1)},
+			Indexes: []ast.CIStr{ast.NewCIStr($1)},
 		}
 	}
 |	IndexNameList ',' Identifier
 	{
 		h := $1
-		h.Indexes = append(h.Indexes, model.NewCIStr($3))
+		h.Indexes = append(h.Indexes, ast.NewCIStr($3))
 		$$ = h
 	}
 
@@ -570,9 +634,18 @@ SubqueryStrategies:
 Value:
 	hintStringLit
 |	Identifier
+|	hintNumericLit
 |	hintIntLit
 	{
 		$$ = strconv.FormatUint($1, 10)
+	}
+|	'+' hintNumericLit
+	{
+		$$ = $2
+	}
+|	'-' hintNumericLit
+	{
+		$$ = "-" + $2
 	}
 |	'+' hintIntLit
 	{
@@ -645,7 +718,7 @@ SupportedTableLevelOptimizerHintName:
 |	"NO_HASH_JOIN"
 |	"HASH_JOIN_BUILD"
 |	"HASH_JOIN_PROBE"
-|	"LEADING"
+|	"HYPO_INDEX"
 
 UnsupportedIndexLevelOptimizerHintName:
 	"INDEX_MERGE"
@@ -664,6 +737,9 @@ SupportedIndexLevelOptimizerHintName:
 |	"FORCE_INDEX"
 |	"ORDER_INDEX"
 |	"NO_ORDER_INDEX"
+|	"INDEX_LOOKUP_PUSHDOWN"
+|	"NO_INDEX_LOOKUP_PUSHDOWN"
+|	"TIFLASH_LM_FILTER"
 
 SubqueryOptimizerHintName:
 	"SEMIJOIN"
@@ -733,10 +809,12 @@ Identifier:
 |	"SET_VAR"
 |	"RESOURCE_GROUP"
 |	"QB_NAME"
+|	"HYPO_INDEX"
 /* TiDB hint names */
 |	"AGG_TO_COP"
 |	"LIMIT_TO_COP"
 |	"IGNORE_PLAN_CACHE"
+|	"WRITE_SLOW_LOG"
 |	"HASH_AGG"
 |	"MPP_1PHASE_AGG"
 |	"MPP_2PHASE_AGG"
@@ -765,6 +843,8 @@ Identifier:
 |	"USE_INDEX"
 |	"ORDER_INDEX"
 |	"NO_ORDER_INDEX"
+|	"INDEX_LOOKUP_PUSHDOWN"
+|	"NO_INDEX_LOOKUP_PUSHDOWN"
 |	"USE_PLAN_CACHE"
 |	"USE_TOJA"
 |	"TIME_RANGE"
@@ -775,6 +855,7 @@ Identifier:
 |	"LEADING"
 |	"SEMI_JOIN_REWRITE"
 |	"NO_DECORRELATE"
+|	"TIFLASH_LM_FILTER"
 /* other keywords */
 |	"OLAP"
 |	"OLTP"

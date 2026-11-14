@@ -42,7 +42,7 @@ type windowTest struct {
 func (p *windowTest) genSrcChk() *chunk.Chunk {
 	srcChk := chunk.NewChunkWithCapacity([]*types.FieldType{p.dataType}, p.numRows)
 	dataGen := getDataGenFunc(p.dataType)
-	for i := 0; i < p.numRows; i++ {
+	for i := range p.numRows {
 		dt := dataGen(i)
 		srcChk.AppendDatum(0, &dt)
 	}
@@ -72,7 +72,7 @@ func testWindowFunc(t *testing.T, p windowTest) {
 	}
 
 	require.Len(t, p.results, p.numRows)
-	for i := 0; i < p.numRows; i++ {
+	for i := range p.numRows {
 		err = finalFunc.AppendFinalResult2Chunk(ctx, finalPr, resultChk)
 		require.NoError(t, err)
 		dt := resultChk.GetRow(0).GetDatum(0, desc.RetTp)
@@ -94,7 +94,7 @@ func testWindowAggMemFunc(t *testing.T, p windowMemTest) {
 	finalPr, memDelta := finalFunc.AllocPartialResult()
 	require.Equal(t, p.allocMemDelta, memDelta)
 
-	updateMemDeltas, err := p.updateMemDeltaGens(srcChk, p.windowTest.dataType)
+	updateMemDeltas, err := p.updateMemDeltaGens(updateMemDeltaGensParams{srcChk: srcChk, keyType: p.windowTest.dataType, valType: nil})
 	require.NoError(t, err)
 
 	i := 0
@@ -107,7 +107,7 @@ func testWindowAggMemFunc(t *testing.T, p windowMemTest) {
 	}
 }
 
-func buildWindowTesterWithArgs(funcName string, tp byte, args []expression.Expression, orderByCols int, numRows int, results ...interface{}) windowTest {
+func buildWindowTesterWithArgs(funcName string, tp byte, args []expression.Expression, orderByCols int, numRows int, results ...any) windowTest {
 	pt := windowTest{
 		dataType: types.NewFieldType(tp),
 		numRows:  numRows,
@@ -127,7 +127,7 @@ func buildWindowTesterWithArgs(funcName string, tp byte, args []expression.Expre
 	return pt
 }
 
-func buildWindowTester(funcName string, tp byte, constantArg uint64, orderByCols int, numRows int, results ...interface{}) windowTest {
+func buildWindowTester(funcName string, tp byte, constantArg uint64, orderByCols int, numRows int, results ...any) windowTest {
 	pt := windowTest{
 		dataType: types.NewFieldType(tp),
 		numRows:  numRows,

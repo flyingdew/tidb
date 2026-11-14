@@ -82,6 +82,8 @@ func TestPlanIDChanged(t *testing.T) {
 		{typeShuffleID, 54},
 		{typeShuffleReceiverID, 55},
 		{typeImportIntoID, 59},
+		{typeLocalIndexLookUpID, 61},
+		{typeAnalyzeID, 64},
 	}
 
 	for _, testcase := range testCases {
@@ -90,7 +92,7 @@ func TestPlanIDChanged(t *testing.T) {
 }
 
 func TestReverse(t *testing.T) {
-	for i := 1; i <= 55; i++ {
+	for i := 1; i <= 64; i++ {
 		require.Equal(t, TypeStringToPhysicalID(PhysicalIDToTypeString(i)), i)
 	}
 }

@@ -23,6 +23,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -30,33 +32,228 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/config/deploymode"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/extension"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/parser/auth"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
-	"github.com/pingcap/tidb/pkg/server/internal"
+	"github.com/pingcap/tidb/pkg/parser/terror"
+	plannercore "github.com/pingcap/tidb/pkg/planner/core"
+	"github.com/pingcap/tidb/pkg/planner/core/base"
+	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
+	"github.com/pingcap/tidb/pkg/resourcegroup"
+	servererr "github.com/pingcap/tidb/pkg/server/err"
 	"github.com/pingcap/tidb/pkg/server/internal/handshake"
+	"github.com/pingcap/tidb/pkg/server/internal/packetio"
 	"github.com/pingcap/tidb/pkg/server/internal/parse"
 	"github.com/pingcap/tidb/pkg/server/internal/testutil"
 	serverutil "github.com/pingcap/tidb/pkg/server/internal/util"
 	"github.com/pingcap/tidb/pkg/session"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/sessiontxn"
 	"github.com/pingcap/tidb/pkg/store/mockstore"
 	"github.com/pingcap/tidb/pkg/store/mockstore/unistore"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/external"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/pingcap/tidb/pkg/util"
 	"github.com/pingcap/tidb/pkg/util/arena"
+	"github.com/pingcap/tidb/pkg/util/breakpoint"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
+	"github.com/pingcap/tidb/pkg/util/metricsutil"
+	"github.com/pingcap/tidb/pkg/util/plancodec"
 	"github.com/pingcap/tidb/pkg/util/sqlkiller"
+	tlsutil "github.com/pingcap/tidb/pkg/util/tls"
+	"github.com/prometheus/client_golang/prometheus"
+	promtestutils "github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 	tikverr "github.com/tikv/client-go/v2/error"
 	"github.com/tikv/client-go/v2/testutils"
+	"github.com/tikv/client-go/v2/tikvrpc"
+	tikvutil "github.com/tikv/client-go/v2/util"
 )
+
+func TestMatchIdentityWithVariantsStarter(t *testing.T) {
+	if !kerneltype.IsNextGen() {
+		t.Skip("starter deploy mode is nextgen-only")
+	}
+
+	restoreConfig := config.RestoreFunc()
+	originalMode := deploymode.Get()
+	t.Cleanup(func() {
+		restoreConfig()
+		require.NoError(t, deploymode.Set(originalMode))
+	})
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.KeyspaceName = "SYSTEM"
+	})
+	require.NoError(t, deploymode.Set(deploymode.Starter))
+
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("create user if not exists `SYSTEM.test_user`@`%`")
+
+	cfg := serverutil.NewTestConfig()
+	cfg.Port = 0
+	cfg.Status.StatusPort = 0
+	srv, err := NewServer(cfg, NewTiDBDriver(store))
+	require.NoError(t, err)
+	defer srv.Close()
+
+	resp := handshake.Response41{
+		Capability: mysql.ClientProtocol41 | mysql.ClientPluginAuth,
+		AuthPlugin: mysql.AuthNativePassword,
+		Auth:       []byte{},
+	}
+	newClientConn := func(user string, connectionID uint64) *clientConn {
+		cc := &clientConn{
+			connectionID: connectionID,
+			alloc:        arena.NewAllocator(1024),
+			chunkAlloc:   chunk.NewAllocator(),
+			pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+			server:       srv,
+			user:         user,
+			peerHost:     "localhost",
+		}
+
+		se, err := session.CreateSession4Test(store)
+		require.NoError(t, err)
+		cc.SetCtx(&TiDBContext{
+			Session: se,
+			stmts:   make(map[int]*TiDBStatement),
+		})
+		return cc
+	}
+
+	cc := newClientConn("test_user", 1)
+	_, err = cc.checkAuthPlugin(context.Background(), &resp)
+	require.NoError(t, err)
+	require.Equal(t, "SYSTEM.test_user", cc.user)
+
+	tk.MustExec("create user if not exists `SYSTEM.keao.yang`@`%`")
+	cc = newClientConn("keao.yang", 2)
+	_, err = cc.checkAuthPlugin(context.Background(), &resp)
+	require.NoError(t, err)
+	require.Equal(t, "SYSTEM.keao.yang", cc.user)
+
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.KeyspaceName = "OTHER"
+	})
+	tk.MustExec("create user if not exists `OTHER.test_user`@`%`")
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.KeyspaceName = "SYSTEM"
+	})
+
+	cc = newClientConn("OTHER.test_user", 3)
+	_, err = cc.checkAuthPlugin(context.Background(), &resp)
+	require.True(t, errors.ErrorEqual(err, servererr.ErrUserPrefixMismatch), "%v", err)
+}
+
+func TestReadHandshakeGatewayTLSAttrStarter(t *testing.T) {
+	if !kerneltype.IsNextGen() {
+		t.Skip("starter deploy mode is nextgen-only")
+	}
+
+	restoreConfig := config.RestoreFunc()
+	originalMode := deploymode.Get()
+	originalSecureTransport := tlsutil.RequireSecureTransport.Load()
+	originalEnv := os.Getenv("GATEWAY_SECURECONN_ATTR_KEY")
+	t.Cleanup(func() {
+		restoreConfig()
+		require.NoError(t, deploymode.Set(originalMode))
+		tlsutil.RequireSecureTransport.Store(originalSecureTransport)
+		if originalEnv == "" {
+			require.NoError(t, os.Unsetenv("GATEWAY_SECURECONN_ATTR_KEY"))
+		} else {
+			require.NoError(t, os.Setenv("GATEWAY_SECURECONN_ATTR_KEY", originalEnv))
+		}
+	})
+
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.KeyspaceName = "ks"
+	})
+	require.NoError(t, deploymode.Set(deploymode.Starter))
+	tlsutil.RequireSecureTransport.Store(true)
+	require.NoError(t, os.Setenv("GATEWAY_SECURECONN_ATTR_KEY", "secure_conn"))
+
+	capability := mysql.ClientProtocol41 | mysql.ClientPluginAuth | mysql.ClientConnectAtts
+	attrPayload := []byte{
+		byte(len("secure_conn")),
+	}
+	attrPayload = append(attrPayload, "secure_conn"...)
+	attrValue := `{"CipherSuite":4865,"Version":771}`
+	attrPayload = append(attrPayload, byte(len(attrValue)))
+	attrPayload = append(attrPayload, attrValue...)
+	data := buildHandshakeResponsePacket(capability, attrPayload, nil)
+	packet := append([]byte{byte(len(data)), byte(len(data) >> 8), byte(len(data) >> 16), 0}, data...)
+
+	brc := serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: *bytes.NewBuffer(packet)})
+	pkt := packetio.New(brc)
+	pkt.SetBufWriter(bufio.NewWriter(bytes.NewBuffer(nil)))
+
+	store := testkit.CreateMockStore(t)
+	cfg := serverutil.NewTestConfig()
+	cfg.Port = 0
+	cfg.Status.StatusPort = 0
+	srv, err := NewServer(cfg, NewTiDBDriver(store))
+	require.NoError(t, err)
+	defer srv.Close()
+
+	cc := &clientConn{
+		connectionID: 1,
+		alloc:        arena.NewAllocator(1024),
+		chunkAlloc:   chunk.NewAllocator(),
+		server:       srv,
+		pkt:          pkt,
+		bufReadConn:  brc,
+		collation:    mysql.DefaultCollationID,
+		capability:   defaultCapability,
+		peerHost:     "127.0.0.1",
+		peerPort:     "4000",
+		serverHost:   "127.0.0.1",
+	}
+	ctx, err := srv.driver.OpenCtx(cc.connectionID, cc.capability, cc.collation, "", nil, nil)
+	require.NoError(t, err)
+	cc.SetCtx(ctx)
+
+	err = cc.readOptionalSSLRequestAndHandshakeResponse(context.Background())
+	require.Error(t, err)
+	require.False(t, errors.ErrorEqual(err, servererr.ErrSecureTransportRequired))
+	require.NotNil(t, cc.tlsConnState)
+	require.Equal(t, uint16(771), cc.tlsConnState.Version)
+	require.Equal(t, uint16(4865), cc.tlsConnState.CipherSuite)
+
+	connInfo := cc.connectInfo()
+	require.Equal(t, variable.ConnTypeTLS, connInfo.ConnectionType)
+	require.Equal(t, "TLSv1.2", connInfo.SSLVersion)
+
+	ctx.SetProcessInfo("", time.Now(), mysql.ComSleep, 0)
+	srv.rwlock.Lock()
+	srv.clients[cc.connectionID] = cc
+	srv.rwlock.Unlock()
+	statusVars := srv.GetStatusVars()
+	require.Equal(t, tlsutil.CipherSuiteName(cc.tlsConnState.CipherSuite), statusVars[cc.connectionID]["Ssl_cipher"])
+	require.Equal(t, tlsutil.VersionName(cc.tlsConnState.Version), statusVars[cc.connectionID]["Ssl_version"])
+
+	tlsVersion := tlsutil.VersionName(cc.tlsConnState.Version)
+	tlsCipher := tlsutil.CipherSuiteName(cc.tlsConnState.CipherSuite)
+	versionBefore := promtestutils.ToFloat64(metrics.TLSVersion.WithLabelValues(tlsVersion))
+	cipherBefore := promtestutils.ToFloat64(metrics.TLSCipher.WithLabelValues(tlsCipher))
+	cc.addConnMetrics()
+	require.Equal(t, versionBefore+1, promtestutils.ToFloat64(metrics.TLSVersion.WithLabelValues(tlsVersion)))
+	require.Equal(t, cipherBefore+1, promtestutils.ToFloat64(metrics.TLSCipher.WithLabelValues(tlsCipher)))
+}
 
 type Issue33699CheckType struct {
 	name              string
@@ -81,6 +278,7 @@ func (c *Issue33699CheckType) toGetSessionVar() string {
 
 func TestIssue33699(t *testing.T) {
 	store := testkit.CreateMockStore(t)
+	metrics.ConnGauge.Reset()
 
 	var outBuffer bytes.Buffer
 	tidbdrv := NewTiDBDriver(store)
@@ -95,7 +293,7 @@ func TestIssue33699(t *testing.T) {
 		connectionID: 1,
 		salt:         []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14},
 		server:       server,
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(&outBuffer)),
+		pkt:          packetio.NewForTest(bufio.NewWriter(&outBuffer)),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
 		alloc:        arena.NewAllocator(512),
@@ -187,6 +385,81 @@ func TestIssue33699(t *testing.T) {
 	}
 }
 
+func TestChangeUserAndResetSessionResourceGroupCounter(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	metrics.ConnGauge.Reset()
+
+	metrics.ConnGauge.WithLabelValues(resourcegroup.DefaultResourceGroupName).Inc()
+
+	requireCounter := func(rgTest, defaultGroup float64) {
+		require.Equal(t, rgTest, promtestutils.ToFloat64(metrics.ConnGauge.WithLabelValues("rg_test")))
+		require.Equal(t, defaultGroup, promtestutils.ToFloat64(metrics.ConnGauge.WithLabelValues(resourcegroup.DefaultResourceGroupName)))
+	}
+
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("create resource group rg_test RU_PER_SEC = 1000;")
+	tk.MustExec("set resource group rg_test")
+	requireCounter(1, 0)
+
+	tidbdrv := NewTiDBDriver(store)
+	cfg := serverutil.NewTestConfig()
+	cfg.Port, cfg.Status.StatusPort = 0, 0
+	cfg.Status.ReportStatus = false
+	server, err := NewServer(cfg, tidbdrv)
+	require.NoError(t, err)
+	defer server.Close()
+
+	var outBuffer bytes.Buffer
+	cc := &clientConn{
+		connectionID: 1,
+		salt:         []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14},
+		server:       server,
+		pkt:          packetio.NewForTest(bufio.NewWriter(&outBuffer)),
+		collation:    mysql.DefaultCollationID,
+		peerHost:     "localhost",
+		alloc:        arena.NewAllocator(512),
+		chunkAlloc:   chunk.NewAllocator(),
+		capability:   mysql.ClientProtocol41,
+	}
+	cc.SetCtx(&TiDBContext{Session: tk.Session()})
+
+	changeUser := func(user, db string) error {
+		data := append([]byte(user), 0x0, 0x0)
+		data = append(data, []byte(db)...)
+		data = append(data, 0x0)
+		return cc.dispatch(context.Background(), append([]byte{mysql.ComChangeUser}, data...))
+	}
+
+	require.NoError(t, changeUser("root", "test"))
+	requireCounter(0, 1)
+
+	_, err = cc.ctx.Session.Execute(context.Background(), "set resource group rg_test")
+	require.NoError(t, err)
+	requireCounter(1, 0)
+	err = cc.dispatch(context.Background(), []byte{mysql.ComResetConnection})
+	require.NoError(t, err)
+	requireCounter(0, 1)
+
+	// Change to a user bound to a resource group, where authentication itself moves the counter.
+	tk.MustExec("create user u_rg resource group rg_test")
+	require.NoError(t, changeUser("u_rg", ""))
+	requireCounter(1, 0)
+	require.NoError(t, changeUser("u_rg", ""))
+	requireCounter(1, 0)
+
+	// Authentication succeeds and binds the group, then useDB fails and the old session is restored.
+	require.Error(t, changeUser("u_rg", "no_such_db"))
+	require.Equal(t, "u_rg", cc.user)
+	requireCounter(1, 0)
+
+	require.Error(t, changeUser("no_such_user", ""))
+	require.Equal(t, "u_rg", cc.user)
+	requireCounter(1, 0)
+
+	require.NoError(t, changeUser("root", ""))
+	requireCounter(0, 1)
+}
+
 func TestMalformHandshakeHeader(t *testing.T) {
 	data := []byte{0x00}
 	var p handshake.Response41
@@ -247,6 +520,114 @@ func TestParseHandshakeResponse(t *testing.T) {
 	require.Equal(t, "test", p.DBName)
 }
 
+func encodeLengthEncodedIntForHandshake(v uint64) []byte {
+	switch {
+	case v < 251:
+		return []byte{byte(v)}
+	case v < 1<<16:
+		return []byte{0xfc, byte(v), byte(v >> 8)}
+	case v < 1<<24:
+		return []byte{0xfd, byte(v), byte(v >> 8), byte(v >> 16)}
+	default:
+		return []byte{0xfe, byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24), byte(v >> 32), byte(v >> 40), byte(v >> 48), byte(v >> 56)}
+	}
+}
+
+func buildHandshakeResponsePacket(capability uint32, attrsPayload []byte, attrsLenOverride *uint64) []byte {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.LittleEndian, capability)
+	binary.Write(&buf, binary.LittleEndian, uint32(0)) // max packet size
+	buf.WriteByte(0)                                   // collation
+	buf.Write(make([]byte, 23))                        // reserved
+
+	buf.WriteString("root")
+	buf.WriteByte(0) // user null-terminated
+	buf.WriteByte(0) // auth null-terminated (legacy path)
+
+	if capability&mysql.ClientConnectAtts > 0 {
+		attrsLen := uint64(len(attrsPayload))
+		if attrsLenOverride != nil {
+			attrsLen = *attrsLenOverride
+		}
+		buf.Write(encodeLengthEncodedIntForHandshake(attrsLen))
+		buf.Write(attrsPayload)
+	}
+
+	return buf.Bytes()
+}
+
+func TestHandshakeResponseCompatibilityAndFailurePaths(t *testing.T) {
+	t.Run("legacy client without connect attrs capability", func(t *testing.T) {
+		data := buildHandshakeResponsePacket(mysql.ClientProtocol41, nil, nil)
+
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.NoError(t, err)
+		require.Equal(t, "root", p.User)
+		require.Empty(t, p.Attrs)
+	})
+
+	t.Run("malformed connect attrs length declaration", func(t *testing.T) {
+		attrsPayload := []byte{2, 'a', 'b', 2, 'c', 'd'}
+		declaredLen := uint64(len(attrsPayload) + 3)
+		data := buildHandshakeResponsePacket(mysql.ClientProtocol41|mysql.ClientConnectAtts, attrsPayload, &declaredLen)
+
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.ErrorIs(t, err, mysql.ErrMalformPacket)
+	})
+
+	t.Run("truncated connect attrs length header", func(t *testing.T) {
+		data := buildHandshakeResponsePacket(mysql.ClientProtocol41|mysql.ClientConnectAtts, nil, nil)
+		data[len(data)-1] = 0xfe
+
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.ErrorIs(t, err, mysql.ErrMalformPacket)
+	})
+
+	t.Run("truncated auth length header", func(t *testing.T) {
+		var buf bytes.Buffer
+		binary.Write(&buf, binary.LittleEndian, mysql.ClientProtocol41|mysql.ClientPluginAuthLenencClientData)
+		binary.Write(&buf, binary.LittleEndian, uint32(0)) // max packet size
+		buf.WriteByte(0)                                   // collation
+		buf.Write(make([]byte, 23))                        // reserved
+		buf.WriteString("root")
+		buf.WriteByte(0)    // user null-terminated
+		buf.WriteByte(0xfe) // truncated auth length-encoded header
+		data := buf.Bytes()
+
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.ErrorIs(t, err, mysql.ErrMalformPacket)
+	})
+
+	t.Run("oversize connect attrs declaration rejected", func(t *testing.T) {
+		declaredLen := uint64(1<<20 + 1)
+		data := buildHandshakeResponsePacket(mysql.ClientProtocol41|mysql.ClientConnectAtts, nil, &declaredLen)
+
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "connection refused: session connection attributes exceed the 1 MiB hard limit")
+	})
+}
+
 func TestIssue1768(t *testing.T) {
 	// this data is from captured handshake packet, using mysql client.
 	// TiDB should handle authorization correctly, even mysql client set
@@ -287,7 +668,7 @@ func TestInitialHandshake(t *testing.T) {
 		connectionID: 1,
 		salt:         []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14},
 		server:       srv,
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(&outBuffer)),
+		pkt:          packetio.NewForTest(bufio.NewWriter(&outBuffer)),
 	}
 
 	err = cc.writeInitialHandshake(context.TODO())
@@ -609,13 +990,24 @@ func testDispatch(t *testing.T, inputs []dispatchInput, capability uint32) {
 	cfg.Status.ReportStatus = false
 	server, err := NewServer(cfg, tidbdrv)
 	require.NoError(t, err)
+
+	// Set healthy. This is used by graceful shutdown
+	// and is used in the response for ComPing and the
+	// /status HTTP endpoint
+	server.health.Store(true)
 	defer server.Close()
+	conn, peerConn := net.Pipe()
+	t.Cleanup(func() {
+		require.NoError(t, conn.Close())
+		require.NoError(t, peerConn.Close())
+	})
 
 	cc := &clientConn{
 		connectionID: 1,
 		salt:         []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14},
 		server:       server,
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(&outBuffer)),
+		pkt:          packetio.NewForTest(bufio.NewWriter(&outBuffer)),
+		bufReadConn:  serverutil.NewBufferedReadConn(conn),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
 		alloc:        arena.NewAllocator(512),
@@ -623,6 +1015,10 @@ func testDispatch(t *testing.T, inputs []dispatchInput, capability uint32) {
 		capability:   capability,
 	}
 	cc.SetCtx(tc)
+	originalEnableConnectionEventLog := vardef.EnableConnectionEventLog.Swap(true)
+	t.Cleanup(func() {
+		vardef.EnableConnectionEventLog.Store(originalEnableConnectionEventLog)
+	})
 	for _, cs := range inputs {
 		inBytes := append([]byte{cs.com}, cs.in...)
 		err := cc.dispatch(context.Background(), inBytes)
@@ -654,7 +1050,7 @@ func TestGetSessionVarsWaitTimeout(t *testing.T) {
 		},
 	}
 	cc.SetCtx(tc)
-	require.Equal(t, uint64(variable.DefWaitTimeout), cc.getSessionVarsWaitTimeout(context.Background()))
+	require.Equal(t, uint64(vardef.DefWaitTimeout), cc.getSessionVarsWaitTimeout(context.Background()))
 }
 
 func mapIdentical(m1, m2 map[string]string) bool {
@@ -707,7 +1103,7 @@ func TestConnExecutionTimeout(t *testing.T) {
 
 	tk.MustExec("use test;")
 	tk.MustExec("CREATE TABLE testTable2 (id bigint PRIMARY KEY,  age int)")
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		str := fmt.Sprintf("insert into testTable2 values(%d, %d)", i, i%80)
 		tk.MustExec(str)
 	}
@@ -720,6 +1116,16 @@ func TestConnExecutionTimeout(t *testing.T) {
 	tk.MustQuery("select SLEEP(1);").Check(testkit.Rows("0"))
 	err := tk.QueryToErr("select * FROM testTable2 WHERE SLEEP(1);")
 	require.Equal(t, "[executor:3024]Query execution was interrupted, maximum statement execution time exceeded", err.Error())
+	// Test executor stats when execution time exceeded.
+	tk.MustExec("set @@tidb_slow_log_threshold=300")
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/store/mockstore/unistore/unistoreRPCSlowByInjestSleep", `return(150)`))
+	err = tk.QueryToErr("select /*+ max_execution_time(600), set_var(tikv_client_read_timeout=100) */ * from testTable2")
+	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/store/mockstore/unistore/unistoreRPCSlowByInjestSleep"))
+	require.Error(t, err)
+	require.Equal(t, "[executor:3024]Query execution was interrupted, maximum statement execution time exceeded", err.Error())
+	planInfo, err := plancodec.DecodePlan(tk.Session().GetSessionVars().StmtCtx.GetEncodedPlan())
+	require.NoError(t, err)
+	require.Regexp(t, "TableReader.*cop_task: {num: .*num_rpc:.*, total_time:.*", planInfo)
 
 	// Killed because of max execution time, reset Killed to 0.
 	tk.Session().GetSessionVars().SQLKiller.SendKillSignal(sqlkiller.MaxExecTimeExceeded)
@@ -735,13 +1141,138 @@ func TestConnExecutionTimeout(t *testing.T) {
 
 	err = cc.handleQuery(context.Background(), "select /*+ MAX_EXECUTION_TIME(100)*/  * FROM testTable2 WHERE  SLEEP(1);")
 	require.Equal(t, "[executor:3024]Query execution was interrupted, maximum statement execution time exceeded", err.Error())
-
+	err = cc.handleQuery(context.Background(), "select /*+ set_var(max_execution_time=100) */ age, sleep(1) from testTable2 union all select age, 1 from testTable2")
+	require.Equal(t, "[executor:3024]Query execution was interrupted, maximum statement execution time exceeded", err.Error())
 	// Killed because of max execution time, reset Killed to 0.
 	tk.Session().GetSessionVars().SQLKiller.SendKillSignal(sqlkiller.MaxExecTimeExceeded)
 	tk.MustExec("set @@max_execution_time = 500;")
 
 	err = cc.handleQuery(context.Background(), "alter table testTable2 add index idx(age);")
 	require.NoError(t, err)
+}
+
+func TestConnDMLExecutionTimeout(t *testing.T) {
+	const dmlTimeout = 500
+
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	setup := testkit.NewTestKit(t, store)
+	setup.MustExec("use test")
+	setup.MustExec("create table dml_timeout (id int primary key)")
+
+	srv := CreateMockServer(t, store)
+	defer srv.Close()
+	go dom.ExpensiveQueryHandle().SetSessionManager(srv).Run()
+
+	runBlockedRPC := func(
+		t *testing.T,
+		conn MockConn,
+		sql string,
+		target tikvrpc.CmdType,
+		rpcResultAfterTimeout func(*tikvrpc.Response, error) (*tikvrpc.Response, error),
+	) error {
+		t.Helper()
+		require.NoError(t, failpoint.Enable("tikvclient/onRPCFinishedHook", "return"))
+		defer func() {
+			require.NoError(t, failpoint.Disable("tikvclient/onRPCFinishedHook"))
+		}()
+
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var enteredOnce, releaseOnce sync.Once
+		releaseHook := func() {
+			releaseOnce.Do(func() { close(release) })
+		}
+		defer releaseHook()
+
+		hook := func(req *tikvrpc.Request, resp *tikvrpc.Response, rpcErr error) (*tikvrpc.Response, error) {
+			if req.Type != target {
+				return resp, rpcErr
+			}
+			// Block the primary commit response to exercise classic 2PC outcome handling.
+			if target == tikvrpc.CmdCommit && req.Commit().GetCommitRole() != kvrpcpb.CommitRole_Primary {
+				return resp, rpcErr
+			}
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+			return rpcResultAfterTimeout(resp, rpcErr)
+		}
+		ctx, cancel := context.WithCancel(context.WithValue(context.Background(), "onRPCFinishedHook", hook))
+		defer cancel()
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- conn.Dispatch(ctx, append([]byte{mysql.ComQuery}, sql...))
+		}()
+
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s RPC was not reached", target)
+		}
+		require.Eventually(t, func() bool {
+			pi := conn.Context().ShowProcess()
+			return pi != nil && pi.MaxExecutionTime == dmlTimeout &&
+				conn.Context().GetSessionVars().SQLKiller.GetKillSignal() == sqlkiller.MaxExecTimeExceeded
+		}, 5*time.Second, 10*time.Millisecond)
+
+		// killQuery sets the SQLKiller signal before canceling the dispatch context.
+		// Cancel the parent explicitly so the hook result is observed with a canceled
+		// request context even if the test sees the signal in that narrow interval.
+		cancel()
+		releaseHook()
+		select {
+		case err := <-errCh:
+			return err
+		case <-time.After(5 * time.Second):
+			t.Fatal("statement did not return after releasing the RPC hook")
+		}
+		return nil
+	}
+	returnCanceled := func(*tikvrpc.Response, error) (*tikvrpc.Response, error) {
+		return nil, context.Canceled
+	}
+	returnOriginal := func(resp *tikvrpc.Response, rpcErr error) (*tikvrpc.Response, error) {
+		return resp, rpcErr
+	}
+
+	configureConn := func(t *testing.T) (MockConn, *testkit.TestKit) {
+		t.Helper()
+		conn := CreateMockConn(t, srv)
+		tk := testkit.NewTestKitWithSession(t, store, conn.Context().Session)
+		tk.MustExec("use test")
+		tk.MustExec("set tidb_enable_1pc = OFF")
+		tk.MustExec("set tidb_enable_async_commit = OFF")
+		tk.MustExec("set tidb_dml_max_execution_time = 500")
+		return conn, tk
+	}
+
+	t.Run("explicit commit", func(t *testing.T) {
+		conn, tk := configureConn(t)
+		defer conn.Close()
+		tk.MustExec("begin optimistic")
+		tk.MustExec("insert into dml_timeout values (2)")
+		err := runBlockedRPC(t, conn, "commit", tikvrpc.CmdPrewrite, returnCanceled)
+		require.True(t, exeerrors.ErrMaxExecTimeExceeded.Equal(err), "%v", err)
+		require.NoError(t, conn.Dispatch(context.Background(), append([]byte{mysql.ComQuery}, "select 1"...)))
+	})
+
+	t.Run("autocommit commit succeeds after timeout", func(t *testing.T) {
+		conn, _ := configureConn(t)
+		defer conn.Close()
+		err := runBlockedRPC(t, conn, "insert into dml_timeout values (4)", tikvrpc.CmdCommit, returnOriginal)
+		require.NoError(t, err)
+		setup.MustQuery("select id from dml_timeout where id = 4").Check(testkit.Rows("4"))
+		require.NoError(t, conn.Dispatch(context.Background(), append([]byte{mysql.ComQuery}, "select 1"...)))
+	})
+
+	t.Run("explicit commit result undetermined after timeout", func(t *testing.T) {
+		conn, tk := configureConn(t)
+		defer conn.Close()
+		tk.MustExec("begin optimistic")
+		tk.MustExec("insert into dml_timeout values (5)")
+		err := runBlockedRPC(t, conn, "commit", tikvrpc.CmdCommit, returnCanceled)
+		require.True(t, terror.ErrResultUndetermined.Equal(err), "%v", err)
+		setup.MustQuery("select id from dml_timeout where id = 5").Check(testkit.Rows("5"))
+	})
 }
 
 func TestShutDown(t *testing.T) {
@@ -769,22 +1300,72 @@ func TestShutDown(t *testing.T) {
 	cc = &clientConn{server: srv}
 	cc.SetCtx(tc)
 
-	// test in txn
-	srv.clients[dom.NextConnID()] = cc
-	cc.getCtx().GetSessionVars().SetInTxn(true)
+	waitMap := [][]bool{
+		// Reading, Not Reading
+		{false, true}, // Not InTxn
+		{true, true},  // InTxn
+	}
+	for idx, waitMap := range waitMap {
+		inTxn := idx > 0
+		for idx, shouldWait := range waitMap {
+			reading := idx == 0
+			if inTxn {
+				cc.getCtx().GetSessionVars().SetInTxn(true)
+			} else {
+				cc.getCtx().GetSessionVars().SetInTxn(false)
+			}
+			if reading {
+				cc.CompareAndSwapStatus(cc.getStatus(), connStatusReading)
+			} else {
+				cc.CompareAndSwapStatus(cc.getStatus(), connStatusDispatching)
+			}
 
-	waitTime := 100 * time.Millisecond
-	begin := time.Now()
-	srv.DrainClients(waitTime, waitTime)
-	require.Greater(t, time.Since(begin), waitTime)
+			srv.clients[dom.NextConnID()] = cc
 
-	// test not in txn
-	srv.clients[dom.NextConnID()] = cc
+			waitTime := 100 * time.Millisecond
+			begin := time.Now()
+			srv.DrainClients(waitTime, waitTime)
+
+			if shouldWait {
+				require.Greater(t, time.Since(begin), waitTime)
+			} else {
+				require.Less(t, time.Since(begin), waitTime)
+			}
+		}
+	}
+}
+
+func TestCommitWaitGroup(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+
+	se, err := session.CreateSession4Test(store)
+	require.NoError(t, err)
+	tc := &TiDBContext{Session: se}
+
+	cfg := serverutil.NewTestConfig()
+	cfg.Port = 0
+	cfg.Status.StatusPort = 0
+	drv := NewTiDBDriver(store)
+	srv, err := NewServer(cfg, drv)
+	require.NoError(t, err)
+	srv.SetDomain(dom)
+
+	cc := &clientConn{server: srv}
+	cc.SetCtx(tc)
+	cc.CompareAndSwapStatus(cc.getStatus(), connStatusReading)
 	cc.getCtx().GetSessionVars().SetInTxn(false)
+	srv.clients[dom.NextConnID()] = cc
 
-	begin = time.Now()
-	srv.DrainClients(waitTime, waitTime)
-	require.Less(t, time.Since(begin), waitTime)
+	wg := cc.getCtx().GetCommitWaitGroup()
+	wg.Add(1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		wg.Done()
+	}()
+	begin := time.Now()
+	srv.DrainClients(time.Second, time.Second)
+	require.Greater(t, time.Since(begin), 100*time.Millisecond)
+	require.Less(t, time.Since(begin), time.Second)
 }
 
 type snapshotCache interface {
@@ -797,12 +1378,12 @@ func TestPrefetchPointKeys4Update(t *testing.T) {
 	cc := &clientConn{
 		alloc:      arena.NewAllocator(1024),
 		chunkAlloc: chunk.NewAllocator(),
-		pkt:        internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 	}
 	tk := testkit.NewTestKit(t, store)
 	cc.SetCtx(&TiDBContext{Session: tk.Session()})
 	ctx := context.Background()
-	tk.Session().GetSessionVars().EnableClusteredIndex = variable.ClusteredIndexDefModeIntOnly
+	tk.Session().GetSessionVars().EnableClusteredIndex = vardef.ClusteredIndexDefModeIntOnly
 	tk.MustExec("use test")
 	tk.MustExec("create table prefetch (a int, b int, c int, primary key (a, b))")
 	tk.MustExec("insert prefetch values (1, 1, 1), (2, 2, 2), (3, 3, 3)")
@@ -823,7 +1404,7 @@ func TestPrefetchPointKeys4Update(t *testing.T) {
 	require.True(t, txn.Valid())
 	snap := txn.GetSnapshot()
 	//nolint:forcetypeassert
-	require.Equal(t, 4, snap.(snapshotCache).SnapCacheHitCount())
+	require.Equal(t, 6, snap.(snapshotCache).SnapCacheHitCount())
 	tk.MustExec("commit")
 	tk.MustQuery("select * from prefetch").Check(testkit.Rows("1 1 2", "2 2 4", "3 3 4"))
 
@@ -846,12 +1427,12 @@ func TestPrefetchPointKeys4Delete(t *testing.T) {
 	cc := &clientConn{
 		alloc:      arena.NewAllocator(1024),
 		chunkAlloc: chunk.NewAllocator(),
-		pkt:        internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 	}
 	tk := testkit.NewTestKit(t, store)
 	cc.SetCtx(&TiDBContext{Session: tk.Session()})
 	ctx := context.Background()
-	tk.Session().GetSessionVars().EnableClusteredIndex = variable.ClusteredIndexDefModeIntOnly
+	tk.Session().GetSessionVars().EnableClusteredIndex = vardef.ClusteredIndexDefModeIntOnly
 	tk.MustExec("use test")
 	tk.MustExec("create table prefetch (a int, b int, c int, primary key (a, b))")
 	tk.MustExec("insert prefetch values (1, 1, 1), (2, 2, 2), (3, 3, 3)")
@@ -873,7 +1454,7 @@ func TestPrefetchPointKeys4Delete(t *testing.T) {
 	require.True(t, txn.Valid())
 	snap := txn.GetSnapshot()
 	//nolint:forcetypeassert
-	require.Equal(t, 4, snap.(snapshotCache).SnapCacheHitCount())
+	require.Equal(t, 6, snap.(snapshotCache).SnapCacheHitCount())
 	tk.MustExec("commit")
 	tk.MustQuery("select * from prefetch").Check(testkit.Rows("4 4 4", "5 5 5", "6 6 6"))
 
@@ -891,6 +1472,52 @@ func TestPrefetchPointKeys4Delete(t *testing.T) {
 	require.Equal(t, 6, tk.Session().GetSessionVars().TxnCtx.PessimisticCacheHit)
 	tk.MustExec("commit")
 	tk.MustQuery("select * from prefetch").Check(testkit.Rows())
+
+	t.Run("scalar followed by a prebuilt PointGet", func(t *testing.T) {
+		tk.MustExec("insert into prefetch values (1, 1, 10), (2, 2, 20)")
+		tk.MustExec("begin optimistic")
+		defer tk.MustExec("rollback")
+		tk.MustQuery("select c from prefetch where a = 1 and b = 1").Check(testkit.Rows("10"))
+		var response bytes.Buffer
+		cc.pkt = packetio.NewForTest(bufio.NewWriter(&response))
+		var registrySizes, scalarTreeCounts []int
+		tk.Session().SetValue(breakpoint.NotifyBreakPointFuncKey, func(_ string) {
+			vars := tk.Session().GetSessionVars()
+			plan, ok := vars.StmtCtx.GetPlan().(base.Plan)
+			require.True(t, ok)
+			prebuilt, ok := tk.Session().Value(plannercore.PointPlanKey).(plannercore.PointPlanVal)
+			require.True(t, ok, "handleQuery must supply the prefetched plan entry")
+			if len(registrySizes) == 0 {
+				require.Nil(t, prebuilt.Plan)
+			} else {
+				require.IsType(t, &physicalop.PointGetPlan{}, plan)
+				require.Same(t, prebuilt.Plan, plan, "the second statement must use the prebuilt plan")
+			}
+			registrySizes = append(registrySizes, len(vars.MapScalarSubQ))
+			scalarTreeCounts = append(scalarTreeCounts, len(plannercore.FlattenPhysicalPlan(plan, true).ScalarSubQueries))
+		})
+		defer tk.Session().ClearValue(breakpoint.NotifyBreakPointFuncKey)
+		testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/util/breakpoint/"+sessiontxn.BreakPointBeforeExecutorFirstRun, "return")
+		err := cc.handleQuery(ctx, "select (select sum(c) from prefetch);select c from prefetch where a = 2 and b = 2;")
+		require.NoError(t, err)
+		t.Logf("multi-statement registry sizes=%v flattened scalar trees=%v", registrySizes, scalarTreeCounts)
+
+		// Each one-column result has a header, column definition, EOF, row and EOF.
+		packets := packetio.New(serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: response}))
+		for _, expected := range []string{"30", "20"} {
+			for range 3 {
+				_, err = packets.ReadPacket()
+				require.NoError(t, err)
+			}
+			row, err := packets.ReadPacket()
+			require.NoError(t, err)
+			require.Equal(t, append([]byte{byte(len(expected))}, expected...), row)
+			_, err = packets.ReadPacket()
+			require.NoError(t, err)
+		}
+		require.Equal(t, []int{1, 0}, scalarTreeCounts)
+		require.Equal(t, []int{1, 0}, registrySizes)
+	})
 }
 
 func TestPrefetchBatchPointGet(t *testing.T) {
@@ -899,7 +1526,7 @@ func TestPrefetchBatchPointGet(t *testing.T) {
 	cc := &clientConn{
 		alloc:      arena.NewAllocator(1024),
 		chunkAlloc: chunk.NewAllocator(),
-		pkt:        internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 	}
 	tk := testkit.NewTestKit(t, store)
 	cc.SetCtx(&TiDBContext{Session: tk.Session()})
@@ -934,7 +1561,7 @@ func TestPrefetchPartitionTable(t *testing.T) {
 	cc := &clientConn{
 		alloc:      arena.NewAllocator(1024),
 		chunkAlloc: chunk.NewAllocator(),
-		pkt:        internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 	}
 	tk := testkit.NewTestKit(t, store)
 	cc.SetCtx(&TiDBContext{Session: tk.Session()})
@@ -981,7 +1608,7 @@ func TestTiFlashFallback(t *testing.T) {
 	cc := &clientConn{
 		alloc:      arena.NewAllocator(1024),
 		chunkAlloc: chunk.NewAllocator(),
-		pkt:        internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 	}
 
 	tk := testkit.NewTestKit(t, store)
@@ -994,11 +1621,11 @@ func TestTiFlashFallback(t *testing.T) {
 	tk.MustExec("create table t(a int not null primary key, b int not null)")
 	tk.MustExec("alter table t set tiflash replica 1")
 	tb := external.GetTableByName(t, tk, "test", "t")
-	err := domain.GetDomain(tk.Session()).DDL().UpdateTableReplicaInfo(tk.Session(), tb.Meta().ID, true)
+	err := domain.GetDomain(tk.Session()).DDLExecutor().UpdateTableReplicaInfo(tk.Session(), tb.Meta().ID, true)
 	require.NoError(t, err)
 
 	dml := "insert into t values"
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		dml += fmt.Sprintf("(%v, 0)", i)
 		if i != 49 {
 			dml += ","
@@ -1022,6 +1649,7 @@ func TestTiFlashFallback(t *testing.T) {
 	require.NoError(t, cc.HandleStmtPrepare(ctx, "select sum(a) from t"))
 	require.NoError(t, cc.handleStmtExecute(ctx, []byte{0x1, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0}))
 	tk.MustQuery("show warnings").Check(testkit.Rows("Error 9012 TiFlash server timeout"))
+	require.Contains(t, cc.ctx.GetSessionVars().IsolationReadEngines, kv.TiFlash)
 
 	// test COM_STMT_FETCH (cursor mode)
 	require.Error(t, cc.handleStmtExecute(ctx, []byte{0x1, 0x0, 0x0, 0x0, 0x1, 0x1, 0x0, 0x0, 0x0}))
@@ -1039,6 +1667,10 @@ func TestTiFlashFallback(t *testing.T) {
 	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/server/fetchNextErr", "return(\"secondNext\")"))
 	tk.MustExec("set @@tidb_allow_fallback_to_tikv='tiflash'")
 	require.Error(t, cc.handleQuery(ctx, "select * from t t1 join t t2 on t1.a = t2.a"))
+	// Only the first execution will fail: a replay would succeed and hide the error.
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/server/fetchNextErr", `2*return("secondNext")->off`))
+	require.Error(t, cc.handleStmtExecute(ctx, []byte{0x1, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0}))
+	require.Contains(t, cc.ctx.GetSessionVars().IsolationReadEngines, kv.TiFlash)
 	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/server/fetchNextErr"))
 
 	// simple TiFlash query (unary + non-streaming)
@@ -1100,7 +1732,7 @@ func TestShowErrors(t *testing.T) {
 	cc := &clientConn{
 		alloc:      arena.NewAllocator(1024),
 		chunkAlloc: chunk.NewAllocator(),
-		pkt:        internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 	}
 	ctx := context.Background()
 	tk := testkit.NewTestKit(t, store)
@@ -1142,7 +1774,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1161,7 +1793,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1182,7 +1814,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1202,7 +1834,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1223,7 +1855,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1244,7 +1876,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1265,7 +1897,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1285,7 +1917,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1307,7 +1939,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1328,7 +1960,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1349,7 +1981,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1369,7 +2001,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1391,7 +2023,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1412,7 +2044,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1433,7 +2065,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1453,7 +2085,7 @@ func TestHandleAuthPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "unativepassword",
 	}
@@ -1485,7 +2117,7 @@ func TestChangeUserAuth(t *testing.T) {
 		peerHost:     "localhost",
 		collation:    mysql.DefaultCollationID,
 		capability:   defaultCapability,
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "root",
 	}
@@ -1511,6 +2143,337 @@ func TestChangeUserAuth(t *testing.T) {
 	err = cc.handleChangeUser(ctx, data)
 	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/server/ChangeUserAuthSwitch"))
 	require.EqualError(t, err, t.Name())
+	require.Same(t, tc, cc.getCtx())
+	require.Equal(t, "root", cc.user)
+}
+
+func TestChangeUserAuthSwitch(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("CREATE USER low_priv")
+	salt := []byte("12345678901234567890")
+	scramble := func(plugin, password string) []byte {
+		if password == "" {
+			return []byte{}
+		}
+		hash := auth.Sha256Hash
+		if plugin == mysql.AuthNativePassword {
+			hash = auth.Sha1Hash
+		} else if plugin == mysql.AuthTiDBSM3Password {
+			hash = auth.Sm3Hash
+		}
+		stage1 := hash([]byte(password))
+		stage2 := hash(stage1)
+		var mask []byte
+		if plugin == mysql.AuthNativePassword {
+			mask = hash(append(append([]byte{}, salt...), stage2...))
+		} else {
+			mask = hash(append(stage2, salt...))
+		}
+		for i := range stage1 {
+			stage1[i] ^= mask[i]
+		}
+		return stage1
+	}
+	cfg := serverutil.NewTestConfig()
+	cfg.Port, cfg.Status.StatusPort = 0, 0
+	srv, err := NewServer(cfg, NewTiDBDriver(store))
+	require.NoError(t, err)
+	defer srv.Close()
+
+	for _, testCase := range []struct {
+		name             string
+		plugin           string
+		password         string
+		emptySwitch      bool
+		noSwitch         bool
+		wrongPassword    bool
+		omitContinuation bool
+	}{
+		{name: "native_empty", plugin: mysql.AuthNativePassword},
+		{name: "native_empty_response", plugin: mysql.AuthNativePassword, password: "password", emptySwitch: true},
+		{name: "native_no_switch", plugin: mysql.AuthNativePassword, password: "password", noSwitch: true},
+		{name: "sha2", plugin: mysql.AuthCachingSha2Password, password: "password"},
+		{name: "sha2_empty", plugin: mysql.AuthCachingSha2Password},
+		{name: "sha2_wrong_password", plugin: mysql.AuthCachingSha2Password, password: "password", wrongPassword: true},
+		{name: "sha2_read_error", plugin: mysql.AuthCachingSha2Password, password: "password", omitContinuation: true},
+		{name: "sm3", plugin: mysql.AuthTiDBSM3Password, password: "password"},
+		{name: "sm3_empty", plugin: mysql.AuthTiDBSM3Password},
+		{name: "sm3_read_error", plugin: mysql.AuthTiDBSM3Password, password: "password", omitContinuation: true},
+	} {
+		tk.MustExec(fmt.Sprintf("CREATE USER '%s' IDENTIFIED WITH %s BY '%s'", testCase.name, testCase.plugin, testCase.password))
+		for _, emptyPlugin := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/empty_plugin=%t", testCase.name, emptyPlugin), func(t *testing.T) {
+				var input, output bytes.Buffer
+				needFullAuth := testCase.plugin != mysql.AuthNativePassword && testCase.password != ""
+				if !testCase.noSwitch {
+					response := scramble(testCase.plugin, testCase.password)
+					if testCase.emptySwitch {
+						response = []byte{}
+					}
+					input.Write(append([]byte{byte(len(response)), 0, 0, 1}, response...))
+					if needFullAuth && !testCase.omitContinuation {
+						password := testCase.password
+						if testCase.wrongPassword {
+							password = "wrong_password"
+						}
+						response = append([]byte(password), 0)
+						input.Write(append([]byte{byte(len(response)), 0, 0, 3}, response...))
+					}
+				}
+				brc := serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: input})
+				pkt := packetio.New(brc)
+				pkt.SetBufWriter(bufio.NewWriter(&output))
+				cc := &clientConn{
+					connectionID: 1,
+					alloc:        arena.NewAllocator(1024),
+					chunkAlloc:   chunk.NewAllocator(),
+					peerHost:     "localhost",
+					collation:    mysql.DefaultCollationID,
+					capability:   mysql.ClientProtocol41 | mysql.ClientPluginAuth,
+					pkt:          pkt,
+					bufReadConn:  brc,
+					server:       srv,
+					user:         "low_priv",
+					authPlugin:   mysql.AuthNativePassword,
+					salt:         salt,
+					tlsConnState: &tls.ConnectionState{HandshakeComplete: true},
+				}
+				se, err := session.CreateSession4Test(store)
+				require.NoError(t, err)
+				require.NoError(t, se.Auth(&auth.UserIdentity{Username: "low_priv", Hostname: "localhost"}, nil, nil, nil))
+				oldCtx := &TiDBContext{Session: se, stmts: make(map[int]*TiDBStatement)}
+				cc.SetCtx(oldCtx)
+				defer func() { require.NoError(t, cc.getCtx().Close()) }()
+
+				initialAuth := scramble(mysql.AuthNativePassword, "password")
+				data := append([]byte(testCase.name), 0, byte(len(initialAuth)))
+				data = append(data, initialAuth...)
+				data = append(data, 0, 0, 0) // empty database and two-byte character set
+				if testCase.noSwitch {
+					data = append(data, mysql.AuthNativePassword...)
+					data = append(data, 0)
+				} else if emptyPlugin {
+					data = append(data, 0)
+				}
+				err = cc.handleChangeUser(context.Background(), data)
+				denied := testCase.emptySwitch || testCase.wrongPassword || testCase.omitContinuation
+				if denied {
+					if testCase.omitContinuation {
+						require.ErrorIs(t, err, io.EOF)
+					} else {
+						require.ErrorContains(t, err, "Access denied")
+					}
+					require.Same(t, oldCtx, cc.getCtx())
+					require.Equal(t, "low_priv", cc.user)
+					require.Equal(t, mysql.AuthNativePassword, cc.authPlugin)
+					testkit.NewTestKitWithSession(t, store, se).MustQuery("SELECT CURRENT_USER()").Check(testkit.Rows("low_priv@%"))
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, testCase.name, cc.ctx.GetSessionVars().User.Username)
+				}
+				require.NoError(t, cc.flush(context.Background()))
+				packets := packetio.New(serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: output}))
+				if !testCase.noSwitch {
+					response, err := packets.ReadPacket()
+					require.NoError(t, err)
+					expected := append([]byte{mysql.AuthSwitchRequest}, testCase.plugin...)
+					expected = append(expected, 0)
+					expected = append(expected, salt...)
+					require.Equal(t, append(expected, 0), response)
+					packets.SetSequence(2)
+					if needFullAuth {
+						response, err = packets.ReadPacket()
+						require.NoError(t, err)
+						require.Equal(t, []byte{1, 4}, response)
+						packets.SetSequence(4)
+					}
+				}
+				if !denied {
+					response, err := packets.ReadPacket()
+					require.NoError(t, err)
+					require.Equal(t, mysql.OKHeader, response[0])
+				}
+				if denied || testCase.plugin == mysql.AuthNativePassword {
+					return
+				}
+
+				// The next change uses the negotiated plugin and must authenticate
+				// without another plugin switch.
+				nextUser := testCase.name + "_next"
+				tk.MustExec(fmt.Sprintf("CREATE USER IF NOT EXISTS '%s' IDENTIFIED WITH %s BY '%s'", nextUser, testCase.plugin, testCase.password))
+				require.Equal(t, testCase.plugin, cc.authPlugin)
+				var continuation bytes.Buffer
+				if needFullAuth {
+					response := append([]byte(testCase.password), 0)
+					continuation.Write(append([]byte{byte(len(response)), 0, 0, 1}, response...))
+				}
+				cc.setConn(&testutil.BytesConn{Buffer: continuation})
+				cc.pkt.SetBufWriter(bufio.NewWriter(&output))
+				cc.pkt.SetSequence(0)
+				output.Reset()
+				initialAuth = scramble(testCase.plugin, testCase.password)
+				data = append([]byte(nextUser), 0, byte(len(initialAuth)))
+				data = append(data, initialAuth...)
+				data = append(data, 0, 0, 0) // empty database and two-byte character set
+				data = append(data, testCase.plugin...)
+				data = append(data, 0)
+				require.NoError(t, cc.handleChangeUser(context.Background(), data))
+				require.Equal(t, nextUser, cc.ctx.GetSessionVars().User.Username)
+				require.NoError(t, cc.flush(context.Background()))
+				packets = packetio.New(serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: output}))
+				if needFullAuth {
+					response, err := packets.ReadPacket()
+					require.NoError(t, err)
+					require.Equal(t, []byte{1, 4}, response)
+					packets.SetSequence(2)
+				}
+				response, err := packets.ReadPacket()
+				require.NoError(t, err)
+				require.Equal(t, mysql.OKHeader, response[0])
+			})
+		}
+	}
+}
+
+func TestChangeUserAuthSocket(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("CREATE USER low_priv")
+	tk.MustExec("CREATE USER socket_user IDENTIFIED WITH auth_socket")
+	tk.MustExec("CREATE USER socket_mapped IDENTIFIED WITH auth_socket AS 'socket_os_user'")
+
+	cfg := serverutil.NewTestConfig()
+	cfg.Port = 0
+	cfg.Status.StatusPort = 0
+	srv, err := NewServer(cfg, NewTiDBDriver(store))
+	require.NoError(t, err)
+	defer srv.Close()
+	t.Cleanup(func() { mockOSUserForAuthSocketTest.Store(nil) })
+
+	for _, protocol := range []struct {
+		name       string
+		capability uint32
+		plugin     []byte
+	}{
+		{name: "legacy", capability: mysql.ClientProtocol41},
+		{name: "empty_plugin", capability: mysql.ClientProtocol41 | mysql.ClientPluginAuth, plugin: []byte{0}},
+		{name: "omitted_plugin", capability: mysql.ClientProtocol41 | mysql.ClientPluginAuth},
+		{name: "native_plugin", capability: mysql.ClientProtocol41 | mysql.ClientPluginAuth, plugin: append([]byte(mysql.AuthNativePassword), 0)},
+	} {
+		t.Run(protocol.name, func(t *testing.T) {
+			for _, testCase := range []struct {
+				name   string
+				user   string
+				auth   string
+				unix   bool
+				osUser string
+				denied bool
+			}{
+				{name: "tcp_forged_username", user: "socket_user", auth: "socket_user", denied: true},
+				{name: "tcp_empty_auth", user: "socket_user", denied: true},
+				{name: "tcp_forged_mapping", user: "socket_mapped", auth: "socket_os_user", denied: true},
+				{name: "unix_forged_username", user: "socket_user", auth: "socket_user", unix: true, osUser: "other_os_user", denied: true},
+				{name: "unix_empty_auth", user: "socket_user", unix: true, osUser: "other_os_user", denied: true},
+				{name: "unix_forged_mapping", user: "socket_mapped", auth: "socket_os_user", unix: true, osUser: "other_os_user", denied: true},
+				{name: "unix_matching_username", user: "socket_user", auth: "untrusted_client_data", unix: true, osUser: "socket_user"},
+				{name: "unix_matching_mapping", user: "socket_mapped", unix: true, osUser: "socket_os_user"},
+			} {
+				t.Run(testCase.name, func(t *testing.T) {
+					mockOSUserForAuthSocketTest.Store(&testCase.osUser)
+					cc := &clientConn{
+						connectionID:  1,
+						alloc:         arena.NewAllocator(1024),
+						chunkAlloc:    chunk.NewAllocator(),
+						peerHost:      "localhost",
+						collation:     mysql.DefaultCollationID,
+						capability:    protocol.capability,
+						pkt:           packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+						server:        srv,
+						user:          "low_priv",
+						dbname:        "test",
+						authPlugin:    mysql.AuthNativePassword,
+						isUnixSocket:  testCase.unix,
+						socketCredUID: uint32(os.Getuid()),
+					}
+					se, err := session.CreateSession4Test(store)
+					require.NoError(t, err)
+					require.NoError(t, se.Auth(&auth.UserIdentity{Username: "low_priv", Hostname: "localhost"}, nil, nil, nil))
+					oldCtx := &TiDBContext{Session: se, stmts: make(map[int]*TiDBStatement)}
+					cc.SetCtx(oldCtx)
+					defer func() { require.NoError(t, cc.getCtx().Close()) }()
+
+					data := append([]byte(testCase.user), 0, byte(len(testCase.auth)))
+					data = append(data, testCase.auth...)
+					data = append(data, 0, 0, 0) // empty database and two-byte character set
+					data = append(data, protocol.plugin...)
+					err = cc.handleChangeUser(context.Background(), data)
+					if testCase.denied {
+						require.ErrorContains(t, err, "Access denied")
+						require.Same(t, oldCtx, cc.getCtx())
+						require.Equal(t, "low_priv", cc.user)
+						require.Equal(t, "test", cc.dbname)
+						require.Equal(t, mysql.AuthNativePassword, cc.authPlugin)
+						require.Equal(t, "low_priv", cc.ctx.GetSessionVars().User.Username)
+						testkit.NewTestKitWithSession(t, store, cc.ctx.Session).
+							MustQuery("SELECT CURRENT_USER()").Check(testkit.Rows("low_priv@%"))
+						return
+					}
+					require.NoError(t, err)
+					require.Equal(t, testCase.user, cc.ctx.GetSessionVars().User.Username)
+					require.Equal(t, mysql.AuthSocket, cc.ctx.GetSessionVars().User.AuthPlugin)
+				})
+			}
+		})
+	}
+}
+
+func TestChangeUserAuthFailureRestoresOldSession(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+
+	cfg := serverutil.NewTestConfig()
+	cfg.Port = 0
+	cfg.Status.StatusPort = 0
+
+	drv := NewTiDBDriver(store)
+	srv, err := NewServer(cfg, drv)
+	require.NoError(t, err)
+	defer srv.Close()
+
+	cc := &clientConn{
+		connectionID: 1,
+		alloc:        arena.NewAllocator(1024),
+		chunkAlloc:   chunk.NewAllocator(),
+		peerHost:     "localhost",
+		collation:    mysql.DefaultCollationID,
+		capability:   mysql.ClientProtocol41,
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		server:       srv,
+		user:         "root",
+		dbname:       "old_db",
+	}
+	se, err := session.CreateSession4Test(store)
+	require.NoError(t, err)
+	require.NoError(t, se.Auth(&auth.UserIdentity{Username: "root", Hostname: "localhost"}, nil, nil, nil))
+	tc := &TiDBContext{
+		Session: se,
+		stmts:   make(map[int]*TiDBStatement),
+	}
+	cc.SetCtx(tc)
+
+	data := []byte{}
+	data = append(data, "missing_user"...)
+	data = append(data, 0)
+	data = append(data, 0)
+	data = append(data, "new_db"...)
+	data = append(data, 0)
+	data = append(data, 0, 0)
+	err = cc.handleChangeUser(context.Background(), data)
+	require.Error(t, err)
+	require.Same(t, tc, cc.getCtx())
+	require.Equal(t, "root", cc.user)
+	require.Equal(t, "old_db", cc.dbname)
+	require.Equal(t, "root", cc.ctx.GetSessionVars().User.Username)
 }
 
 func TestAuthPlugin2(t *testing.T) {
@@ -1528,7 +2491,7 @@ func TestAuthPlugin2(t *testing.T) {
 		connectionID: 1,
 		alloc:        arena.NewAllocator(1024),
 		chunkAlloc:   chunk.NewAllocator(),
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "root",
 	}
@@ -1585,7 +2548,7 @@ func TestAuthSessionTokenPlugin(t *testing.T) {
 		chunkAlloc:   chunk.NewAllocator(),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "auth_session_token",
 	}
@@ -1652,11 +2615,11 @@ func TestMaxAllowedPacket(t *testing.T) {
 	)
 
 	// The length of total payload is (25 + 999 = 1024).
-	bytes := append([]byte{0x00, 0x04, 0x00, 0x00}, []byte(fmt.Sprintf("SELECT length('%s') as len;", strings.Repeat("a", 999)))...)
+	bytes := append([]byte{0x00, 0x04, 0x00, 0x00}, fmt.Appendf(nil, "SELECT length('%s') as len;", strings.Repeat("a", 999))...)
 	_, err := inBuffer.Write(bytes)
 	require.NoError(t, err)
 	brc := serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: inBuffer})
-	pkt := internal.NewPacketIO(brc)
+	pkt := packetio.New(brc)
 	pkt.SetMaxAllowedPacket(maxAllowedPacket)
 	readBytes, err = pkt.ReadPacket()
 	require.NoError(t, err)
@@ -1665,11 +2628,11 @@ func TestMaxAllowedPacket(t *testing.T) {
 
 	// The length of total payload is (25 + 1000 = 1025).
 	inBuffer.Reset()
-	bytes = append([]byte{0x01, 0x04, 0x00, 0x00}, []byte(fmt.Sprintf("SELECT length('%s') as len;", strings.Repeat("a", 1000)))...)
+	bytes = append([]byte{0x01, 0x04, 0x00, 0x00}, fmt.Appendf(nil, "SELECT length('%s') as len;", strings.Repeat("a", 1000))...)
 	_, err = inBuffer.Write(bytes)
 	require.NoError(t, err)
 	brc = serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: inBuffer})
-	pkt = internal.NewPacketIO(brc)
+	pkt = packetio.New(brc)
 	pkt.SetMaxAllowedPacket(maxAllowedPacket)
 	_, err = pkt.ReadPacket()
 	require.Error(t, err)
@@ -1677,18 +2640,18 @@ func TestMaxAllowedPacket(t *testing.T) {
 	// The length of total payload is (25 + 488 = 513).
 	// Two separate packets would NOT exceed the limitation of maxAllowedPacket.
 	inBuffer.Reset()
-	bytes = append([]byte{0x01, 0x02, 0x00, 0x00}, []byte(fmt.Sprintf("SELECT length('%s') as len;", strings.Repeat("a", 488)))...)
+	bytes = append([]byte{0x01, 0x02, 0x00, 0x00}, fmt.Appendf(nil, "SELECT length('%s') as len;", strings.Repeat("a", 488))...)
 	_, err = inBuffer.Write(bytes)
 	require.NoError(t, err)
 	brc = serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: inBuffer})
-	pkt = internal.NewPacketIO(brc)
+	pkt = packetio.New(brc)
 	pkt.SetMaxAllowedPacket(maxAllowedPacket)
 	readBytes, err = pkt.ReadPacket()
 	require.NoError(t, err)
 	require.Equal(t, fmt.Sprintf("SELECT length('%s') as len;", strings.Repeat("a", 488)), string(readBytes))
 	require.Equal(t, uint8(1), pkt.Sequence())
 	inBuffer.Reset()
-	bytes = append([]byte{0x01, 0x02, 0x00, 0x01}, []byte(fmt.Sprintf("SELECT length('%s') as len;", strings.Repeat("b", 488)))...)
+	bytes = append([]byte{0x01, 0x02, 0x00, 0x01}, fmt.Appendf(nil, "SELECT length('%s') as len;", strings.Repeat("b", 488))...)
 	_, err = inBuffer.Write(bytes)
 	require.NoError(t, err)
 	brc = serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: inBuffer})
@@ -1697,6 +2660,38 @@ func TestMaxAllowedPacket(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, fmt.Sprintf("SELECT length('%s') as len;", strings.Repeat("b", 488)), string(readBytes))
 	require.Equal(t, uint8(2), pkt.Sequence())
+
+	if kerneltype.IsNextGen() {
+		originalMode := deploymode.Get()
+		originalMaxAllowedPacket := config.GetGlobalConfig().MaxAllowedPacket
+		t.Cleanup(func() {
+			require.NoError(t, deploymode.Set(originalMode))
+			config.UpdateGlobal(func(c *config.Config) {
+				c.MaxAllowedPacket = originalMaxAllowedPacket
+			})
+		})
+
+		require.NoError(t, deploymode.Set(deploymode.Starter))
+		config.UpdateGlobal(func(c *config.Config) {
+			c.MaxAllowedPacket = maxAllowedPacket
+		})
+
+		store := testkit.CreateMockStore(t)
+		tc, err := NewTiDBDriver(store).OpenCtx(1, 0, mysql.DefaultCollationID, "", nil, nil)
+		require.NoError(t, err)
+		require.False(t, tc.GetSessionVars().CommonGlobalLoaded)
+		require.Equal(t, uint64(maxAllowedPacket), tc.GetSessionVars().MaxAllowedPacket)
+
+		inBuffer.Reset()
+		bytes = append([]byte{0x00, 0x08, 0x00, 0x00}, strings.Repeat("a", 2048)...)
+		_, err = inBuffer.Write(bytes)
+		require.NoError(t, err)
+		brc = serverutil.NewBufferedReadConn(&testutil.BytesConn{Buffer: inBuffer})
+		cc := &clientConn{pkt: packetio.New(brc)}
+		cc.SetCtx(tc)
+		_, err = cc.readPacket()
+		require.ErrorContains(t, err, "Got a packet bigger than 'max_allowed_packet' bytes")
+	}
 }
 
 func TestOkEof(t *testing.T) {
@@ -1715,7 +2710,7 @@ func TestOkEof(t *testing.T) {
 		connectionID: 1,
 		salt:         []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14},
 		server:       server,
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(&outBuffer)),
+		pkt:          packetio.NewForTest(bufio.NewWriter(&outBuffer)),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
 		alloc:        arena.NewAllocator(512),
@@ -1776,7 +2771,7 @@ func TestExtensionChangeUser(t *testing.T) {
 		connectionID: 1,
 		salt:         []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14},
 		server:       server,
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(&outBuffer)),
+		pkt:          packetio.NewForTest(bufio.NewWriter(&outBuffer)),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
 		alloc:        arena.NewAllocator(512),
@@ -1885,7 +2880,7 @@ func TestAuthSha(t *testing.T) {
 		connectionID: 1,
 		salt:         []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14},
 		server:       server,
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(&outBuffer)),
+		pkt:          packetio.NewForTest(bufio.NewWriter(&outBuffer)),
 		collation:    mysql.DefaultCollationID,
 		peerHost:     "localhost",
 		alloc:        arena.NewAllocator(512),
@@ -1918,7 +2913,7 @@ func TestProcessInfoForExecuteCommand(t *testing.T) {
 	cc := &clientConn{
 		alloc:      arena.NewAllocator(1024),
 		chunkAlloc: chunk.NewAllocator(),
-		pkt:        internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 	}
 	ctx := context.Background()
 
@@ -1957,7 +2952,7 @@ func TestLDAPAuthSwitch(t *testing.T) {
 		connectionID: 1,
 		alloc:        arena.NewAllocator(1024),
 		chunkAlloc:   chunk.NewAllocator(),
-		pkt:          internal.NewPacketIOForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
 		server:       srv,
 		user:         "test_simple_ldap",
 	}
@@ -2051,7 +3046,7 @@ func TestCloseConn(t *testing.T) {
 			0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14,
 		},
 		server:     server,
-		pkt:        internal.NewPacketIOForTest(bufio.NewWriter(&outBuffer)),
+		pkt:        packetio.NewForTest(bufio.NewWriter(&outBuffer)),
 		collation:  mysql.DefaultCollationID,
 		peerHost:   "localhost",
 		alloc:      arena.NewAllocator(512),
@@ -2062,12 +3057,896 @@ func TestCloseConn(t *testing.T) {
 	var wg sync.WaitGroup
 	const numGoroutines = 10
 	wg.Add(numGoroutines)
-	for i := 0; i < numGoroutines; i++ {
+	for range numGoroutines {
 		go func() {
 			defer wg.Done()
-			err := closeConn(cc, 1)
+			err := closeConn(cc)
 			require.NoError(t, err)
 		}()
 	}
 	wg.Wait()
+}
+
+func TestConnAddMetrics(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	re := require.New(t)
+	tk := testkit.NewTestKit(t, store)
+	cc := &clientConn{
+		alloc:      arena.NewAllocator(1024),
+		chunkAlloc: chunk.NewAllocator(),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+	}
+	tk.MustExec("use test")
+	cc.SetCtx(&TiDBContext{Session: tk.Session(), stmts: make(map[int]*TiDBStatement)})
+
+	// default
+	cc.addQueryMetrics(mysql.ComQuery, time.Now(), nil)
+	counter := metrics.QueryTotalCounter
+	v := promtestutils.ToFloat64(counter.WithLabelValues("Query", "OK", "default"))
+	require.Equal(t, 1.0, v)
+
+	// rg1
+	cc.getCtx().GetSessionVars().ResourceGroupName = "test_rg1"
+	cc.addQueryMetrics(mysql.ComQuery, time.Now(), nil)
+	re.Equal(promtestutils.ToFloat64(counter.WithLabelValues("Query", "OK", "default")), 1.0)
+	re.Equal(promtestutils.ToFloat64(counter.WithLabelValues("Query", "OK", "test_rg1")), 1.0)
+	/// inc the counter again
+	cc.addQueryMetrics(mysql.ComQuery, time.Now(), nil)
+	re.Equal(promtestutils.ToFloat64(counter.WithLabelValues("Query", "OK", "test_rg1")), 2.0)
+
+	// rg2
+	cc.getCtx().GetSessionVars().ResourceGroupName = "test_rg2"
+	// error
+	cc.addQueryMetrics(mysql.ComQuery, time.Now(), errors.New("unknown error"))
+	re.Equal(promtestutils.ToFloat64(counter.WithLabelValues("Query", "Error", "test_rg2")), 1.0)
+	// ok
+	cc.addQueryMetrics(mysql.ComStmtExecute, time.Now(), nil)
+	re.Equal(promtestutils.ToFloat64(counter.WithLabelValues("StmtExecute", "OK", "test_rg2")), 1.0)
+}
+
+func TestConnIACacheMetrics(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	cc := &clientConn{}
+	cc.SetCtx(&TiDBContext{Session: tk.Session(), stmts: make(map[int]*TiDBStatement)})
+	vars := tk.Session().GetSessionVars()
+	vars.StmtCtx.StmtType = "Select"
+	dbNames := metricsutil.GetDBNames(vars)
+	require.Len(t, dbNames, 1)
+	hits := metrics.IACacheHitCount.WithLabelValues("Select", dbNames[0])
+	misses := metrics.IARemoteReadSegmentCount.WithLabelValues("Select", dbNames[0])
+
+	for _, tt := range []struct {
+		name string
+		scan *tikvutil.ScanDetail
+	}{
+		{"cache only", &tikvutil.ScanDetail{IaCacheHitCount: 7}},
+		{"remote only", &tikvutil.ScanDetail{IaRemoteReadSegmentCount: 3}},
+		{"mixed", &tikvutil.ScanDetail{IaCacheHitCount: 5, IaRemoteReadSegmentCount: 2}},
+		{"zero", &tikvutil.ScanDetail{}},
+		{"no scan details", nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			vars.StmtCtx.SyncExecDetails.Reset()
+			vars.StmtCtx.MergeScanDetail(tt.scan)
+			hitsBefore, missesBefore := promtestutils.ToFloat64(hits), promtestutils.ToFloat64(misses)
+			cc.addQueryMetrics(mysql.ComQuery, time.Now(), nil)
+			var wantHits, wantMisses float64
+			if tt.scan != nil {
+				wantHits = float64(tt.scan.IaCacheHitCount)
+				wantMisses = float64(tt.scan.IaRemoteReadSegmentCount)
+			}
+			require.Equal(t, wantHits, promtestutils.ToFloat64(hits)-hitsBefore)
+			require.Equal(t, wantMisses, promtestutils.ToFloat64(misses)-missesBefore)
+		})
+	}
+	count, err := promtestutils.GatherAndCount(prometheus.DefaultGatherer, "tidb_server_ia_cache_hit_count")
+	require.NoError(t, err)
+	require.Positive(t, count)
+}
+
+func TestStatementDurationMetrics(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table statement_duration (id int primary key, v int)")
+	cc := &clientConn{
+		alloc:      arena.NewAllocator(1024),
+		chunkAlloc: chunk.NewAllocator(),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+	}
+	tc := &TiDBContext{Session: tk.Session(), stmts: make(map[int]*TiDBStatement)}
+	cc.SetCtx(tc)
+	vars := tk.Session().GetSessionVars()
+	// Isolate observations from bootstrap and background internal SQL without resetting global metrics.
+	tk.MustExec("create resource group statement_duration_test RU_PER_SEC = UNLIMITED")
+	tk.MustExec("set resource group statement_duration_test")
+	tc.SetClientCapability(vars.ClientCapability | mysql.ClientMultiStatements)
+	ctx := context.Background()
+	readHistogram := func(observer prometheus.Observer) *dto.Metric {
+		metric, ok := observer.(prometheus.Metric)
+		require.True(t, ok)
+		value := &dto.Metric{}
+		require.NoError(t, metric.Write(value))
+		return value
+	}
+	statementMetric := func(sqlType string) *dto.Metric {
+		return readHistogram(metrics.QueryDurationHistogram.WithLabelValues(sqlType, "", vars.ResourceGroupName))
+	}
+
+	t.Run("multi statement timing", func(t *testing.T) {
+		insertBefore := statementMetric("Insert").GetHistogram()
+		updateBefore := statementMetric("Update").GetHistogram()
+		var statementTypes []string
+		tk.Session().SetValue(breakpoint.NotifyBreakPointFuncKey, func(_ string) {
+			statementTypes = append(statementTypes, vars.StmtCtx.StmtType)
+			if vars.StmtCtx.StmtType == "Insert" {
+				// Simulate a slow INSERT and parsing without sleeping. The UPDATE must get its own clock.
+				vars.StartTime = vars.StartTime.Add(-time.Hour)
+				vars.DurationParse = time.Minute
+			}
+		})
+		t.Cleanup(func() { tk.Session().ClearValue(breakpoint.NotifyBreakPointFuncKey) })
+		testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/util/breakpoint/"+sessiontxn.BreakPointBeforeExecutorFirstRun, "return")
+		start := time.Now()
+		err := cc.handleQuery(ctx, "insert into statement_duration values (1, 0); update statement_duration set v = v + 1 where id = 1")
+		require.NoError(t, err)
+		elapsed := time.Since(start).Seconds()
+		require.Equal(t, []string{"Insert", "Update"}, statementTypes)
+		insert := statementMetric("Insert").GetHistogram()
+		update := statementMetric("Update").GetHistogram()
+		require.Equal(t, insertBefore.GetSampleCount()+1, insert.GetSampleCount())
+		require.Equal(t, updateBefore.GetSampleCount()+1, update.GetSampleCount())
+		require.GreaterOrEqual(t, insert.GetSampleSum()-insertBefore.GetSampleSum(), (time.Hour + time.Minute).Seconds())
+		for i, bucket := range insert.GetBucket() {
+			if bucket.GetUpperBound() < (time.Hour + time.Minute).Seconds() {
+				require.Equal(t, insertBefore.GetBucket()[i].GetCumulativeCount(), bucket.GetCumulativeCount())
+			}
+		}
+		// Bound by the measured whole command, not a fixed latency ceiling that flakes on slow CI.
+		require.LessOrEqual(t, update.GetSampleSum()-updateBefore.GetSampleSum(), elapsed)
+
+		// The server histogram still measures one whole command, labeled as MultiStmt.
+		dbNames := metricsutil.GetDBNames(vars)
+		require.Len(t, dbNames, 1)
+		query := metrics.CommandDurationHistogram.WithLabelValues("MultiStmt", dbNames[0], vars.ResourceGroupName)
+		lastStmtQuery := metrics.CommandDurationHistogram.WithLabelValues("Update", dbNames[0], vars.ResourceGroupName)
+		lastStmtQueryBefore := readHistogram(lastStmtQuery).GetHistogram().GetSampleCount()
+		queryBefore := readHistogram(query).GetHistogram()
+		cc.addQueryMetrics(mysql.ComQuery, start, nil)
+		queryAfter := readHistogram(query).GetHistogram()
+		require.Equal(t, queryBefore.GetSampleCount()+1, queryAfter.GetSampleCount())
+		require.Equal(t, lastStmtQueryBefore, readHistogram(lastStmtQuery).GetHistogram().GetSampleCount())
+		require.GreaterOrEqual(t, queryAfter.GetSampleSum()-queryBefore.GetSampleSum(), elapsed)
+		require.LessOrEqual(t, queryAfter.GetSampleSum()-queryBefore.GetSampleSum(), time.Since(start).Seconds())
+		require.Equal(t, update.GetSampleCount(), statementMetric("Update").GetHistogram().GetSampleCount())
+
+		labels := map[string]string{}
+		for _, label := range statementMetric("Insert").GetLabel() {
+			labels[label.GetName()] = label.GetValue()
+		}
+		require.Equal(t, map[string]string{"sql_type": "Insert", "db": "", "resource_group": vars.ResourceGroupName}, labels)
+		buckets := prometheus.ExponentialBuckets(0.0005, 2, 29)
+		require.Len(t, insert.GetBucket(), len(buckets))
+		for i, upperBound := range buckets {
+			require.Equal(t, upperBound, insert.GetBucket()[i].GetUpperBound())
+		}
+		require.Positive(t, promtestutils.CollectAndCount(metrics.QueryDurationHistogram, "tidb_server_handle_query_duration_seconds"))
+		require.Positive(t, promtestutils.CollectAndCount(metrics.CommandDurationHistogram, "tidb_server_handle_command_duration_seconds"))
+	})
+
+	t.Run("database labels", func(t *testing.T) {
+		restoreConfig := config.RestoreFunc()
+		t.Cleanup(restoreConfig)
+		config.UpdateGlobal(func(conf *config.Config) { conf.Status.RecordDBLabel = true })
+		tk.MustExec("create database statement_duration_other")
+		tk.MustExec("create table statement_duration_other.t (id int primary key)")
+		t.Cleanup(func() { tk.MustExec("drop database statement_duration_other") })
+		byDB := func(db string) *dto.Histogram {
+			return readHistogram(metrics.QueryDurationHistogram.WithLabelValues("Select", db, vars.ResourceGroupName)).GetHistogram()
+		}
+		testBefore, otherBefore := byDB("test"), byDB("statement_duration_other")
+		emptyBefore := byDB("").GetSampleCount()
+		start := time.Now()
+		require.NoError(t, cc.handleQuery(ctx, "select * from test.statement_duration; select * from statement_duration_other.t"))
+		require.Equal(t, testBefore.GetSampleCount()+1, byDB("test").GetSampleCount())
+		require.Equal(t, otherBefore.GetSampleCount()+1, byDB("statement_duration_other").GetSampleCount())
+		// Keep the command's original last-statement DB labeling; statements use their own DBs.
+		command := metrics.CommandDurationHistogram.WithLabelValues("MultiStmt", "statement_duration_other", vars.ResourceGroupName)
+		commandBefore := readHistogram(command).GetHistogram().GetSampleCount()
+		cc.addQueryMetrics(mysql.ComQuery, start, nil)
+		require.Equal(t, commandBefore+1, readHistogram(command).GetHistogram().GetSampleCount())
+
+		testBefore, otherBefore = byDB("test"), byDB("statement_duration_other")
+		require.NoError(t, cc.handleQuery(ctx, "select a.id from test.statement_duration a join test.statement_duration b on a.id = b.id join statement_duration_other.t c on a.id = c.id"))
+		testAfter, otherAfter := byDB("test"), byDB("statement_duration_other")
+		// A cross-DB statement is observed once per distinct DB, even with multiple tables in one DB.
+		require.Equal(t, testBefore.GetSampleCount()+1, testAfter.GetSampleCount())
+		require.Equal(t, otherBefore.GetSampleCount()+1, otherAfter.GetSampleCount())
+		require.InDelta(t, testAfter.GetSampleSum()-testBefore.GetSampleSum(), otherAfter.GetSampleSum()-otherBefore.GetSampleSum(), 1e-9)
+		require.Equal(t, emptyBefore, byDB("").GetSampleCount())
+
+		// A statement without table references falls back to the current database.
+		require.NoError(t, cc.handleQuery(ctx, "select 1"))
+		require.Equal(t, testAfter.GetSampleCount()+1, byDB("test").GetSampleCount())
+		require.Equal(t, otherAfter.GetSampleCount(), byDB("statement_duration_other").GetSampleCount())
+	})
+
+	t.Run("command label boundaries", func(t *testing.T) {
+		checkCommand := func(cmd byte, err error, label string) {
+			dbNames := metricsutil.GetDBNames(vars)
+			require.Len(t, dbNames, 1)
+			multi := metrics.CommandDurationHistogram.WithLabelValues("MultiStmt", dbNames[0], vars.ResourceGroupName)
+			single := metrics.CommandDurationHistogram.WithLabelValues("Select", dbNames[0], vars.ResourceGroupName)
+			multiBefore := readHistogram(multi).GetHistogram().GetSampleCount()
+			singleBefore := readHistogram(single).GetHistogram().GetSampleCount()
+			cc.addQueryMetrics(cmd, time.Now(), err)
+			if label == "MultiStmt" {
+				multiBefore++
+			} else {
+				singleBefore++
+			}
+			require.Equal(t, multiBefore, readHistogram(multi).GetHistogram().GetSampleCount())
+			require.Equal(t, singleBefore, readHistogram(single).GetHistogram().GetSampleCount())
+		}
+		for _, tt := range []struct {
+			sql     string
+			label   string
+			wantErr bool
+		}{
+			{"select 1; select 2", "MultiStmt", false},
+			{"select * from statement_duration_missing; select 2", "MultiStmt", true},
+			{"select 1", "Select", false},
+			{"select 'a;b';", "Select", false},
+			{"", "Select", false},
+			{"select from", "Select", true},
+		} {
+			// Every case follows a multi-statement request to catch stale session state.
+			require.NoError(t, cc.handleQuery(ctx, "select 1; select 2"))
+			err := cc.handleQuery(ctx, tt.sql)
+			require.Equal(t, tt.wantErr, err != nil, tt.sql)
+			checkCommand(mysql.ComQuery, err, tt.label)
+		}
+
+		require.NoError(t, cc.handleQuery(ctx, "select 1; select 2"))
+		checkCommand(mysql.ComPing, nil, "Select")
+		stmt, _, _, err := tc.Prepare("select 1")
+		require.NoError(t, err)
+		defer func() { require.NoError(t, stmt.Close()) }()
+		rs, err := stmt.Execute(ctx, nil)
+		require.NoError(t, err)
+		rs.Close()
+		checkCommand(mysql.ComStmtExecute, nil, "Select")
+
+		capability, mode := vars.ClientCapability, vars.MultiStatementMode
+		t.Cleanup(func() {
+			tc.SetClientCapability(capability)
+			vars.MultiStatementMode = mode
+		})
+		tc.SetClientCapability(capability &^ mysql.ClientMultiStatements)
+		vars.MultiStatementMode = variable.OffInt
+		err = cc.handleQuery(ctx, "select 1; select 2")
+		require.Error(t, err)
+		checkCommand(mysql.ComQuery, err, "MultiStmt")
+	})
+
+	t.Run("prepared execute and resultset close", func(t *testing.T) {
+		before := statementMetric("Select").GetHistogram().GetSampleCount()
+		stmt, _, _, err := tc.Prepare("select v from statement_duration where id = 1")
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, stmt.Close()) })
+		require.Equal(t, before, statementMetric("Select").GetHistogram().GetSampleCount())
+		for i := uint64(0); i < 2; i++ {
+			rs, err := stmt.Execute(ctx, nil)
+			require.NoError(t, err)
+			require.NotNil(t, rs)
+			require.Equal(t, before+i, statementMetric("Select").GetHistogram().GetSampleCount())
+			rs.Close()
+			require.Equal(t, before+i+1, statementMetric("Select").GetHistogram().GetSampleCount())
+			rs.Close()
+			require.Equal(t, before+i+1, statementMetric("Select").GetHistogram().GetSampleCount())
+		}
+	})
+
+	t.Run("text prepare and execute", func(t *testing.T) {
+		prepareBefore := statementMetric("Prepare").GetHistogram().GetSampleCount()
+		selectBefore := statementMetric("Select").GetHistogram().GetSampleCount()
+		require.NoError(t, cc.handleQuery(ctx, "prepare duration_stmt from 'select 1'; execute duration_stmt; deallocate prepare duration_stmt"))
+		require.Equal(t, prepareBefore+1, statementMetric("Prepare").GetHistogram().GetSampleCount())
+		require.Equal(t, selectBefore+1, statementMetric("Select").GetHistogram().GetSampleCount())
+	})
+
+	t.Run("parse and compile errors", func(t *testing.T) {
+		before := statementMetric("Select").GetHistogram().GetSampleCount()
+		require.Error(t, cc.handleQuery(ctx, "select from"))
+		require.Error(t, cc.handleQuery(ctx, "select * from statement_duration_missing"))
+		require.Equal(t, before, statementMetric("Select").GetHistogram().GetSampleCount())
+	})
+
+	for _, withParseError := range []bool{false, true} {
+		name := "compile error then binary execute"
+		if withParseError {
+			name = "compile error then parse error then binary execute"
+		}
+		t.Run(name, func(t *testing.T) {
+			// Prepare first: preparing after the error could hide stale parse timing.
+			stmt, _, _, err := tc.Prepare("select 1")
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, stmt.Close()) })
+			t.Cleanup(func() { vars.DurationParse = 0 })
+			before := statementMetric("Select").GetHistogram()
+			stmts, err := tk.Session().Parse(ctx, "select * from test.statement_duration_missing")
+			require.NoError(t, err)
+			require.Len(t, stmts, 1)
+			// Deterministically model an expensive successful parse followed by an early
+			// compile error, which does not reach FinishExecuteStmt.
+			vars.DurationParse = time.Hour
+			rs, err := tk.Session().ExecuteStmt(ctx, stmts[0])
+			require.EqualError(t, err, "[schema:1146]Table 'test.statement_duration_missing' doesn't exist")
+			require.Nil(t, rs)
+			if withParseError {
+				_, err = tk.Session().Parse(ctx, "select from")
+				require.Error(t, err)
+				// Keep going on failure so the same red run also exposes the metric leak.
+				if vars.DurationParse != 0 {
+					t.Errorf("Parse error retained stale DurationParse: %s", vars.DurationParse)
+				}
+			}
+			require.Equal(t, before.GetSampleCount(), statementMetric("Select").GetHistogram().GetSampleCount())
+			require.Equal(t, before.GetSampleSum(), statementMetric("Select").GetHistogram().GetSampleSum())
+
+			start := time.Now()
+			preparedRS, err := stmt.Execute(ctx, nil)
+			require.NoError(t, err)
+			require.NotNil(t, preparedRS)
+			t.Cleanup(func() { preparedRS.Close() })
+			// Check before Close resets timing: binary execution has no parse cost.
+			if vars.DurationParse != 0 {
+				t.Errorf("binary execution inherited stale DurationParse: %s", vars.DurationParse)
+			}
+			require.Equal(t, before.GetSampleCount(), statementMetric("Select").GetHistogram().GetSampleCount())
+			preparedRS.Close()
+			elapsed := time.Since(start).Seconds()
+			after := statementMetric("Select").GetHistogram()
+			require.Equal(t, before.GetSampleCount()+1, after.GetSampleCount())
+			require.Zero(t, vars.DurationParse)
+			// Use the whole measured execution interval rather than a fixed CI latency limit.
+			require.LessOrEqual(t, after.GetSampleSum()-before.GetSampleSum(), elapsed)
+		})
+	}
+
+	t.Run("binary protocol execute after compile error", func(t *testing.T) {
+		stmt, _, _, err := tc.Prepare("select 1")
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, stmt.Close()) })
+		t.Cleanup(func() { vars.DurationParse = 0 })
+		stmts, err := tk.Session().Parse(ctx, "select * from test.statement_duration_missing")
+		require.NoError(t, err)
+		// Model an expensive parse without sleeping; compilation fails before statement cleanup.
+		vars.DurationParse = time.Hour
+		rs, err := tk.Session().ExecuteStmt(ctx, stmts[0])
+		require.EqualError(t, err, "[schema:1146]Table 'test.statement_duration_missing' doesn't exist")
+		require.Nil(t, rs)
+		before := statementMetric("Select").GetHistogram()
+		data := make([]byte, 9)
+		binary.LittleEndian.PutUint32(data, uint32(stmt.ID()))
+		data[5] = 1 // iteration count; no parameters and no cursor
+		start := time.Now()
+		require.NoError(t, cc.handleStmtExecute(ctx, data))
+		after := statementMetric("Select").GetHistogram()
+		require.Equal(t, before.GetSampleCount()+1, after.GetSampleCount())
+		require.LessOrEqual(t, after.GetSampleSum()-before.GetSampleSum(), time.Since(start).Seconds())
+	})
+
+	t.Run("execution error", func(t *testing.T) {
+		require.NoError(t, cc.handleQuery(ctx, "insert into statement_duration values (2, 0)"))
+		before := statementMetric("Insert").GetHistogram().GetSampleCount()
+		require.Error(t, cc.handleQuery(ctx, "insert into statement_duration values (2, 2)"))
+		require.Equal(t, before+1, statementMetric("Insert").GetHistogram().GetSampleCount())
+	})
+
+	t.Run("nested restricted SQL", func(t *testing.T) {
+		showBefore := statementMetric("Show").GetHistogram()
+		selectBefore := statementMetric("Select").GetHistogram()
+		internalBefore := statementMetric(metrics.LblInternal).GetHistogram()
+		command := metrics.CommandDurationHistogram.WithLabelValues(metrics.LblInternal, "", vars.ResourceGroupName)
+		commandBefore := readHistogram(command).GetHistogram().GetSampleCount()
+
+		var outerStartTime time.Time
+		tk.Session().SetValue(breakpoint.NotifyBreakPointFuncKey, func(_ string) {
+			if !vars.InRestrictedSQL && vars.StmtCtx.StmtType == "Show" {
+				// Simulate outer execution and parsing before the nested SQL, without sleeping.
+				vars.StartTime = vars.StartTime.Add(-time.Hour)
+				vars.DurationParse = time.Minute
+				outerStartTime = vars.StartTime
+			}
+		})
+		t.Cleanup(func() { tk.Session().ClearValue(breakpoint.NotifyBreakPointFuncKey) })
+		testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/util/breakpoint/"+sessiontxn.BreakPointBeforeExecutorFirstRun, "return")
+
+		// SHOW TABLE STATUS runs restricted SQL on the current session. Its inner
+		// result set must remain internal, without hiding or resetting the outer statement.
+		start := time.Now()
+		require.NoError(t, cc.handleQuery(ctx, "show table status from test"))
+		elapsed := time.Since(start).Seconds()
+		require.False(t, outerStartTime.IsZero())
+		show := statementMetric("Show").GetHistogram()
+		require.Equal(t, showBefore.GetSampleCount()+1, show.GetSampleCount())
+		require.GreaterOrEqual(t, show.GetSampleSum()-showBefore.GetSampleSum(), (time.Hour + time.Minute).Seconds())
+		for i, bucket := range show.GetBucket() {
+			if bucket.GetUpperBound() < (time.Hour + time.Minute).Seconds() {
+				require.Equal(t, showBefore.GetBucket()[i].GetCumulativeCount(), bucket.GetCumulativeCount())
+			}
+		}
+		require.Equal(t, outerStartTime, vars.StartTime)
+		require.Zero(t, vars.DurationParse)
+		require.Equal(t, selectBefore.GetSampleCount(), statementMetric("Select").GetHistogram().GetSampleCount())
+		internal := statementMetric(metrics.LblInternal).GetHistogram()
+		require.Equal(t, internalBefore.GetSampleCount()+1, internal.GetSampleCount())
+		require.LessOrEqual(t, internal.GetSampleSum()-internalBefore.GetSampleSum(), elapsed)
+		require.Equal(t, commandBefore+1, readHistogram(command).GetHistogram().GetSampleCount())
+		require.False(t, vars.InRestrictedSQL)
+		require.False(t, vars.StmtCtx.InRestrictedSQL)
+		require.Equal(t, "Show", vars.StmtCtx.StmtType)
+
+		// The next user statement must not inherit the outer statement's synthetic timing.
+		start = time.Now()
+		require.NoError(t, cc.handleQuery(ctx, "select 1"))
+		elapsed = time.Since(start).Seconds()
+		selectAfter := statementMetric("Select").GetHistogram()
+		require.Equal(t, selectBefore.GetSampleCount()+1, selectAfter.GetSampleCount())
+		require.LessOrEqual(t, selectAfter.GetSampleSum()-selectBefore.GetSampleSum(), elapsed)
+	})
+
+	t.Run("internal result set close", func(t *testing.T) {
+		before := statementMetric("Select").GetHistogram().GetSampleCount()
+		internalCtx := kv.WithInternalSourceType(ctx, kv.InternalTxnOthers)
+		rs, err := tk.Session().ExecuteInternal(internalCtx, "select 1")
+		require.NoError(t, err)
+		require.NotNil(t, rs)
+		require.False(t, vars.InRestrictedSQL)
+		require.True(t, vars.StmtCtx.InRestrictedSQL)
+		require.NoError(t, rs.Next(internalCtx, rs.NewChunk(nil)))
+		require.NoError(t, rs.Close())
+		// The restored session flag must not turn an internal statement into a user sample.
+		require.Equal(t, before, statementMetric("Select").GetHistogram().GetSampleCount())
+	})
+
+	t.Run("restricted helper retains internal sample", func(t *testing.T) {
+		internalBefore := statementMetric(metrics.LblInternal).GetHistogram()
+		command := metrics.CommandDurationHistogram.WithLabelValues(metrics.LblInternal, "", vars.ResourceGroupName)
+		commandBefore := readHistogram(command).GetHistogram()
+		selectBefore := statementMetric("Select").GetHistogram().GetSampleCount()
+		internalCtx := kv.WithInternalSourceType(ctx, kv.InternalTxnOthers)
+		_, _, err := tk.Session().GetRestrictedSQLExecutor().ExecRestrictedSQL(internalCtx, nil, "select /*+ RESOURCE_GROUP(statement_duration_test) */ 1")
+		require.NoError(t, err)
+		internalAfter := statementMetric(metrics.LblInternal).GetHistogram()
+		commandAfter := readHistogram(command).GetHistogram()
+		require.Equal(t, internalBefore.GetSampleCount()+1, internalAfter.GetSampleCount())
+		require.Equal(t, commandBefore.GetSampleCount()+1, commandAfter.GetSampleCount())
+		require.InDelta(t, internalAfter.GetSampleSum()-internalBefore.GetSampleSum(), commandAfter.GetSampleSum()-commandBefore.GetSampleSum(), 1e-9)
+		require.Equal(t, selectBefore, statementMetric("Select").GetHistogram().GetSampleCount())
+	})
+
+	t.Run("restricted SQL", func(t *testing.T) {
+		before := statementMetric("Select").GetHistogram().GetSampleCount()
+		vars.InRestrictedSQL = true
+		t.Cleanup(func() { vars.InRestrictedSQL = false })
+		internalCtx := kv.WithInternalSourceType(ctx, kv.InternalTxnOthers)
+		require.NoError(t, cc.handleQuery(internalCtx, "select v from statement_duration where id = 1"))
+		require.Equal(t, before, statementMetric("Select").GetHistogram().GetSampleCount())
+	})
+}
+
+func TestIssue54335(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	se, err := session.CreateSession4Test(store)
+	require.NoError(t, err)
+
+	// There is no underlying netCon, use failpoint to avoid panic
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/server/FakeClientConn", "return(1)"))
+	defer func() {
+		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/server/FakeClientConn"))
+	}()
+
+	connID := uint64(1)
+	se.SetConnectionID(connID)
+	tc := &TiDBContext{
+		Session: se,
+		stmts:   make(map[int]*TiDBStatement),
+	}
+	cc := &clientConn{
+		connectionID: connID,
+		server: &Server{
+			capability: defaultCapability,
+		},
+		pkt:        packetio.NewForTest(bufio.NewWriter(io.Discard)),
+		alloc:      arena.NewAllocator(32 * 1024),
+		chunkAlloc: chunk.NewAllocator(),
+	}
+	cc.SetCtx(tc)
+	srv := &Server{
+		clients: map[uint64]*clientConn{
+			connID: cc,
+		},
+		dom: dom,
+	}
+	handle := dom.ExpensiveQueryHandle().SetSessionManager(srv)
+	go handle.Run()
+
+	session.MustExec(t, se, "use test;")
+	session.MustExec(t, se, "CREATE TABLE testTable2 (id bigint,  age int)")
+	str := fmt.Sprintf("insert into testTable2 values(%d, %d)", 1, 1)
+	session.MustExec(t, se, str)
+	for range 14 {
+		session.MustExec(t, se, "insert into testTable2 select * from testTable2")
+	}
+
+	times := 100
+	for ; times > 0; times-- {
+		// Test with -race
+		_ = cc.handleQuery(context.Background(), "select /*+ MAX_EXECUTION_TIME(1)*/  * FROM testTable2;")
+	}
+}
+
+func TestParseHandshakeAttrsTruncation(t *testing.T) {
+	// Save and restore global atomic counters.
+	origSize := vardef.ConnectAttrsSize.Load()
+	origLongest := vardef.ConnectAttrsLongestSeen.Load()
+	origLost := vardef.ConnectAttrsLost.Load()
+	defer func() {
+		vardef.ConnectAttrsSize.Store(origSize)
+		vardef.ConnectAttrsLongestSeen.Store(origLongest)
+		vardef.ConnectAttrsLost.Store(origLost)
+	}()
+
+	t.Run("exceeds limit truncation", func(t *testing.T) {
+		vardef.ConnectAttrsSize.Store(5) // very small limit
+		vardef.ConnectAttrsLongestSeen.Store(0)
+		vardef.ConnectAttrsLost.Store(0)
+
+		// Construct payload
+		// Capability: ClientProtocol41 | ClientConnectAtts
+		var clientCap uint32 = mysql.ClientProtocol41 | mysql.ClientConnectAtts
+
+		var buf bytes.Buffer
+		// Header (32 bytes)
+		binary.Write(&buf, binary.LittleEndian, clientCap)
+		binary.Write(&buf, binary.LittleEndian, uint32(0)) // MaxPacketSize
+		buf.WriteByte(0)                                   // Collation
+		buf.Write(make([]byte, 23))                        // Reserved
+
+		// Body
+		buf.WriteString("root")
+		buf.WriteByte(0) // User null-term
+
+		buf.WriteByte(0) // Auth null-term
+
+		// Attrs: "ab":"cd" (4), "ef":"gh" (4). Total = 8. Limit = 5.
+		attrsBuf := bytes.NewBuffer(nil)
+		// K1
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("ab")
+		// V1
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("cd")
+		// K2
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("ef")
+		// V2
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("gh")
+
+		attrsBytes := attrsBuf.Bytes()
+		buf.WriteByte(byte(len(attrsBytes))) // 12 bytes total length (includes len enc overhead or just payload?)
+		// ParseLengthEncodedInt parses the integer. It returns the integer value.
+		// HandshakeResponseBody uses this value as the length of the *bytes* to consume for attributes.
+		// The bytes consumed are then passed to parseAttrs.
+		// parseAttrs expects `[len][str][len][str]`.
+		// So `attrsBytes` is correct.
+		buf.Write(attrsBytes)
+
+		data := buf.Bytes()
+
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.NoError(t, err)
+
+		// Check truncation
+		require.Len(t, p.Attrs, 2)
+		require.Equal(t, "cd", p.Attrs["ab"])
+		val, ok := p.Attrs["_truncated"]
+		require.True(t, ok)
+		require.Equal(t, "4", val)
+
+		require.Equal(t, int64(1), vardef.ConnectAttrsLost.Load())
+		require.Equal(t, int64(8), vardef.ConnectAttrsLongestSeen.Load()) // 4+4=8
+	})
+
+	t.Run("limit 0 disables collection", func(t *testing.T) {
+		vardef.ConnectAttrsSize.Store(0)
+		vardef.ConnectAttrsLongestSeen.Store(0)
+		vardef.ConnectAttrsLost.Store(0)
+
+		var clientCap uint32 = mysql.ClientProtocol41 | mysql.ClientConnectAtts
+		var buf bytes.Buffer
+		binary.Write(&buf, binary.LittleEndian, clientCap)
+		binary.Write(&buf, binary.LittleEndian, uint32(0))
+		buf.WriteByte(0)
+		buf.Write(make([]byte, 23))
+		buf.WriteString("root")
+		buf.WriteByte(0)
+		buf.WriteByte(0)
+
+		attrsBuf := bytes.NewBuffer(nil)
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("ab")
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("cd")
+		attrsBytes := attrsBuf.Bytes()
+		buf.WriteByte(byte(len(attrsBytes)))
+		buf.Write(attrsBytes)
+		data := buf.Bytes()
+
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.NoError(t, err)
+
+		require.Len(t, p.Attrs, 0)
+		require.Equal(t, int64(0), vardef.ConnectAttrsLost.Load())
+		require.Equal(t, int64(0), vardef.ConnectAttrsLongestSeen.Load())
+	})
+
+	t.Run("limit 65536 acceptance", func(t *testing.T) {
+		vardef.ConnectAttrsSize.Store(65536)
+		vardef.ConnectAttrsLongestSeen.Store(0)
+		vardef.ConnectAttrsLost.Store(0)
+
+		var clientCap uint32 = mysql.ClientProtocol41 | mysql.ClientConnectAtts
+		var buf bytes.Buffer
+		binary.Write(&buf, binary.LittleEndian, clientCap)
+		binary.Write(&buf, binary.LittleEndian, uint32(0))
+		buf.WriteByte(0)
+		buf.Write(make([]byte, 23))
+		buf.WriteString("root")
+		buf.WriteByte(0)
+		buf.WriteByte(0)
+
+		attrsBuf := bytes.NewBuffer(nil)
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("ab")
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("cd")
+		attrsBytes := attrsBuf.Bytes()
+		buf.WriteByte(byte(len(attrsBytes)))
+		buf.Write(attrsBytes)
+		data := buf.Bytes()
+
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.NoError(t, err)
+
+		// 65536 should easily accept everything
+		require.Len(t, p.Attrs, 1)
+		require.Equal(t, "cd", p.Attrs["ab"])
+
+		require.Equal(t, int64(0), vardef.ConnectAttrsLost.Load())
+		require.Equal(t, int64(4), vardef.ConnectAttrsLongestSeen.Load())
+	})
+
+	t.Run("limit 1MiB rejection", func(t *testing.T) {
+		// Construct payload declaring > 1 MiB of attributes.
+		var clientCap uint32 = mysql.ClientProtocol41 | mysql.ClientConnectAtts
+
+		var buf bytes.Buffer
+		// Header (32 bytes)
+		binary.Write(&buf, binary.LittleEndian, clientCap)
+		binary.Write(&buf, binary.LittleEndian, uint32(0))
+		buf.WriteByte(0)
+		buf.Write(make([]byte, 23))
+		// Body
+		buf.WriteString("root")
+		buf.WriteByte(0)
+		buf.WriteByte(0)
+
+		// Encode a length-encoded integer of 1<<20 + 1 (1 MiB + 1 byte).
+		// 0xfd prefix = 3-byte little-endian integer (range 65536–16777215).
+		// 1048577 = 0x100001 → LE bytes: 0x01, 0x00, 0x10.
+		buf.WriteByte(0xfd)
+		buf.WriteByte(0x01)
+		buf.WriteByte(0x00)
+		buf.WriteByte(0x10)
+
+		// The 1 MiB check fires before the bounds-check on
+		// data[offset : offset+num], so no panic is expected.
+
+		data := buf.Bytes()
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "connection refused: session connection attributes exceed the 1 MiB hard limit")
+	})
+
+	t.Run("no limit", func(t *testing.T) {
+		vardef.ConnectAttrsSize.Store(-1) // -1 means no limit up to 64KB
+		vardef.ConnectAttrsLongestSeen.Store(0)
+		vardef.ConnectAttrsLost.Store(0)
+
+		var clientCap uint32 = mysql.ClientProtocol41 | mysql.ClientConnectAtts
+
+		var buf bytes.Buffer
+		// Header (32 bytes)
+		binary.Write(&buf, binary.LittleEndian, clientCap)
+		binary.Write(&buf, binary.LittleEndian, uint32(0))
+		buf.WriteByte(0)
+		buf.Write(make([]byte, 23))
+		// Body
+		buf.WriteString("root")
+		buf.WriteByte(0)
+		buf.WriteByte(0)
+
+		// Attrs: "ab":"cd", "ef":"gh". Total = 8.
+		attrsBuf := bytes.NewBuffer(nil)
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("ab")
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("cd")
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("ef")
+		attrsBuf.WriteByte(2)
+		attrsBuf.WriteString("gh")
+
+		attrsBytes := attrsBuf.Bytes()
+		buf.WriteByte(byte(len(attrsBytes)))
+		buf.Write(attrsBytes)
+
+		data := buf.Bytes()
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.NoError(t, err)
+
+		// All attrs should be accepted, no truncation.
+		require.Len(t, p.Attrs, 2)
+		require.Equal(t, "cd", p.Attrs["ab"])
+		require.Equal(t, "gh", p.Attrs["ef"])
+		_, hasTruncated := p.Attrs["_truncated"]
+		require.False(t, hasTruncated)
+
+		require.Equal(t, int64(0), vardef.ConnectAttrsLost.Load())
+		require.Equal(t, int64(8), vardef.ConnectAttrsLongestSeen.Load())
+	})
+
+	t.Run("longest_seen not updated for large payloads", func(t *testing.T) {
+		// Attrs >= 64KB should NOT update LongestSeen.
+		vardef.ConnectAttrsSize.Store(-1) // Limit mapped to 65536 max internally
+		vardef.ConnectAttrsLongestSeen.Store(100)
+		vardef.ConnectAttrsLost.Store(0)
+
+		var clientCap uint32 = mysql.ClientProtocol41 | mysql.ClientConnectAtts
+
+		var buf bytes.Buffer
+		binary.Write(&buf, binary.LittleEndian, clientCap)
+		binary.Write(&buf, binary.LittleEndian, uint32(0))
+		buf.WriteByte(0)
+		buf.Write(make([]byte, 23))
+		buf.WriteString("root")
+		buf.WriteByte(0)
+		buf.WriteByte(0)
+
+		// Build attrs: one key "k" with a 70000-byte value (total > 64KB).
+		attrsBuf := bytes.NewBuffer(nil)
+		attrsBuf.WriteByte(1) // key length = 1
+		attrsBuf.WriteByte('k')
+		// value length = 70000 → needs 3-byte length-encoded int: 0xfd + 3 LE bytes
+		valLen := 70000
+		attrsBuf.WriteByte(0xfd)
+		attrsBuf.WriteByte(byte(valLen))
+		attrsBuf.WriteByte(byte(valLen >> 8))
+		attrsBuf.WriteByte(byte(valLen >> 16))
+		attrsBuf.Write(make([]byte, valLen)) // value payload
+
+		attrsBytes := attrsBuf.Bytes()
+		// Encode overall attrs length as 3-byte length-encoded int.
+		attrsLen := len(attrsBytes)
+		buf.WriteByte(0xfd)
+		buf.WriteByte(byte(attrsLen))
+		buf.WriteByte(byte(attrsLen >> 8))
+		buf.WriteByte(byte(attrsLen >> 16))
+		buf.Write(attrsBytes)
+
+		data := buf.Bytes()
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.NoError(t, err)
+
+		// Attrs are truncated (totalSize=70001 > effectiveLimit=65536, because
+		// limit=-1 maps to effectiveLimit=65536 internally), but LongestSeen
+		// should NOT be updated because totalSize >= 64KB.
+		require.Equal(t, int64(100), vardef.ConnectAttrsLongestSeen.Load(),
+			"LongestSeen should not be updated for payloads >= 64KB")
+	})
+
+	t.Run("underscore-prefixed attrs include reserved key", func(t *testing.T) {
+		// Keep underscore-prefixed attributes from clients for MySQL parity and
+		// observability. The client-provided "_truncated" is retained when no
+		// truncation occurs; if truncation happens, server may overwrite it.
+		vardef.ConnectAttrsSize.Store(-1) // Limit mapped to 65536 max internally
+		vardef.ConnectAttrsLongestSeen.Store(0)
+		vardef.ConnectAttrsLost.Store(0)
+
+		var clientCap uint32 = mysql.ClientProtocol41 | mysql.ClientConnectAtts
+
+		var buf bytes.Buffer
+		binary.Write(&buf, binary.LittleEndian, clientCap)
+		binary.Write(&buf, binary.LittleEndian, uint32(0))
+		buf.WriteByte(0)
+		buf.Write(make([]byte, 23))
+		buf.WriteString("root")
+		buf.WriteByte(0)
+		buf.WriteByte(0)
+
+		// Attrs:
+		//   "_client_name":"Go-MySQL-Driver"  → must be kept
+		//   "_os":"linux"                     → must be kept
+		//   "_program_name":"mysql"           → must be kept
+		//   "_custom":"val"                   → must be kept
+		//   "_truncated":"fake"               → kept (may be overwritten by server on truncation)
+		//   "app_name":"myapp"                → must be kept
+		attrsBuf := bytes.NewBuffer(nil)
+		for _, kv := range [][2]string{
+			{"_client_name", "Go-MySQL-Driver"},
+			{"_os", "linux"},
+			{"_program_name", "mysql"},
+			{"_custom", "val"},
+			{"_truncated", "fake"},
+			{"app_name", "myapp"},
+		} {
+			attrsBuf.WriteByte(byte(len(kv[0])))
+			attrsBuf.WriteString(kv[0])
+			attrsBuf.WriteByte(byte(len(kv[1])))
+			attrsBuf.WriteString(kv[1])
+		}
+
+		attrsBytes := attrsBuf.Bytes()
+		buf.WriteByte(byte(len(attrsBytes)))
+		buf.Write(attrsBytes)
+
+		data := buf.Bytes()
+		var p handshake.Response41
+		offset, err := parse.HandshakeResponseHeader(context.Background(), &p, data)
+		require.NoError(t, err)
+
+		err = parse.HandshakeResponseBody(context.Background(), &p, data, offset)
+		require.NoError(t, err)
+
+		// All keys are kept.
+		require.Len(t, p.Attrs, 6)
+		require.Equal(t, "Go-MySQL-Driver", p.Attrs["_client_name"])
+		require.Equal(t, "linux", p.Attrs["_os"])
+		require.Equal(t, "mysql", p.Attrs["_program_name"])
+		require.Equal(t, "val", p.Attrs["_custom"])
+		require.Equal(t, "fake", p.Attrs["_truncated"])
+		require.Equal(t, "myapp", p.Attrs["app_name"])
+
+		require.Equal(t, int64(0), vardef.ConnectAttrsLost.Load())
+	})
 }

@@ -37,6 +37,7 @@ import (
 type advisoryLock struct {
 	ctx            context.Context
 	session        *session
+	clean          func()
 	referenceCount int
 	owner          uint64
 }
@@ -61,7 +62,7 @@ func (a *advisoryLock) ReferenceCount() int {
 func (a *advisoryLock) Close() {
 	_, err := a.session.ExecuteInternal(a.ctx, "ROLLBACK")
 	terror.Log(err)
-	a.session.Close()
+	a.clean()
 }
 
 // GetLock acquires a new advisory lock using a pessimistic transaction.
@@ -72,10 +73,12 @@ func (a *advisoryLock) GetLock(lockName string, timeout int64) error {
 	a.ctx = kv.WithInternalSourceType(a.ctx, kv.InternalTxnOthers)
 	_, err := a.session.ExecuteInternal(a.ctx, "SET innodb_lock_wait_timeout = %?", timeout)
 	if err != nil {
+		a.Close()
 		return err
 	}
 	_, err = a.session.ExecuteInternal(a.ctx, "BEGIN PESSIMISTIC")
 	if err != nil {
+		a.Close()
 		return err
 	}
 	_, err = a.session.ExecuteInternal(a.ctx, "INSERT INTO mysql.advisory_locks (lock_name) VALUES (%?)", lockName)

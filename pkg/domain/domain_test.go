@@ -27,23 +27,75 @@ import (
 	"github.com/ngaut/pools"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
 	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/ddl"
 	"github.com/pingcap/tidb/pkg/domain/infosync"
+	"github.com/pingcap/tidb/pkg/domain/serverinfo"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/metrics"
+	"github.com/pingcap/tidb/pkg/owner"
 	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/planner/core/resolve"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/store/mockstore"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/mock"
+	"github.com/pingcap/tidb/pkg/util/sqlexec"
+	stmtsummaryv2 "github.com/pingcap/tidb/pkg/util/stmtsummary/v2"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 	pd "github.com/tikv/pd/client"
+	"github.com/tikv/pd/client/opt"
 	"go.etcd.io/etcd/tests/v3/integration"
 )
+
+type fakeExternalWorkloadManager struct {
+	role         config.ExternalWorkloadRole
+	updatedValue *bool
+}
+
+func (m *fakeExternalWorkloadManager) Close() error { return nil }
+func (m *fakeExternalWorkloadManager) Role() config.ExternalWorkloadRole {
+	return m.role
+}
+func (*fakeExternalWorkloadManager) Meta() *keyspacepb.KeyspaceMeta { return nil }
+func (*fakeExternalWorkloadManager) InitializeGCV2(context.Context, time.Duration) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) AbortGCV2(context.Context) error { return nil }
+func (*fakeExternalWorkloadManager) RegisterGCV2(context.Context, uint64, time.Duration) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) RecycleGCV2(context.Context, uint64) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) UpdateGCLifeTime(context.Context, time.Duration) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) RegisterTTLTableInfo(context.Context, int64, bool) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) DeleteTTLTableInfo(context.Context, int64) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) RecycleTTLTask(context.Context, uint64) error {
+	return nil
+}
+func (m *fakeExternalWorkloadManager) UpdateTTLJobEnable(_ context.Context, ttlJobEnable bool) error {
+	m.updatedValue = &ttlJobEnable
+	return nil
+}
+func (*fakeExternalWorkloadManager) RegisterAutoAnalyze(context.Context, uint64) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) RecycleAutoAnalyze(context.Context, uint64) error {
+	return nil
+}
 
 func TestInfo(t *testing.T) {
 	t.Skip("TestInfo will hang currently, it should be fixed later")
@@ -71,7 +123,7 @@ func TestInfo(t *testing.T) {
 		Storage: s,
 		pdAddrs: []string{cluster.Members[0].GRPCURL()}}
 	ddlLease := 80 * time.Millisecond
-	dom := NewDomain(mockStore, ddlLease, 0, 0, 0, mockFactory)
+	dom := NewDomain(mockStore, ddlLease, 0, 0, mockFactory)
 	defer func() {
 		dom.Close()
 		err := s.Close()
@@ -82,17 +134,19 @@ func TestInfo(t *testing.T) {
 	dom.etcdClient = client
 	// Mock new DDL and init the schema syncer with etcd client.
 	goCtx := context.Background()
-	dom.ddl = ddl.NewDDL(
+	dom.ddl, dom.ddlExecutor = ddl.NewDDL(
 		goCtx,
 		ddl.WithEtcdClient(dom.GetEtcdClient()),
 		ddl.WithStore(s),
 		ddl.WithInfoCache(dom.infoCache),
 		ddl.WithLease(ddlLease),
+		ddl.WithSchemaLoader(dom.isSyncer),
 	)
 	ddl.DisableTiFlashPoll(dom.ddl)
 	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/domain/MockReplaceDDL", `return(true)`))
 	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/ddl/NoDDLDispatchLoop", `return(true)`))
-	require.NoError(t, dom.Init(ddlLease, sysMockFactory, nil))
+	require.NoError(t, dom.Init(sysMockFactory, nil))
+	require.NoError(t, dom.Start(ddl.Bootstrap))
 	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/ddl/NoDDLDispatchLoop"))
 	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/domain/MockReplaceDDL"))
 
@@ -119,13 +173,13 @@ func TestInfo(t *testing.T) {
 	require.Equalf(t, info.ID, infos[ddlID].ID, "server one info %v, info %v", infos[ddlID], info)
 
 	// Test the scene where syncer.Done() gets the information.
-	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/ddl/syncer/ErrorMockSessionDone", `return(true)`))
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/ddl/schemaver/ErrorMockSessionDone", `return(true)`))
 	<-dom.ddl.SchemaSyncer().Done()
-	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/ddl/syncer/ErrorMockSessionDone"))
+	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/ddl/schemaver/ErrorMockSessionDone"))
 	time.Sleep(15 * time.Millisecond)
 	syncerStarted := false
-	for i := 0; i < 1000; i++ {
-		if dom.SchemaValidator.IsStarted() {
+	for range 1000 {
+		if dom.GetSchemaValidator().IsStarted() {
 			syncerStarted = true
 			break
 		}
@@ -134,7 +188,7 @@ func TestInfo(t *testing.T) {
 	require.True(t, syncerStarted)
 
 	stmt := &ast.CreateDatabaseStmt{
-		Name: model.NewCIStr("aaa"),
+		Name: ast.NewCIStr("aaa"),
 		// Make sure loading schema is normal.
 		Options: []*ast.DatabaseOption{
 			{
@@ -148,12 +202,12 @@ func TestInfo(t *testing.T) {
 		},
 	}
 	ctx := mock.NewContext()
-	require.NoError(t, dom.ddl.CreateSchema(ctx, stmt))
-	require.NoError(t, dom.Reload())
+	require.NoError(t, dom.ddlExecutor.CreateSchema(ctx, stmt))
+	require.NoError(t, dom.isSyncer.Reload())
 	require.Equal(t, int64(1), dom.InfoSchema().SchemaMetaVersion())
 
 	// Test for RemoveServerInfo.
-	dom.info.RemoveServerInfo()
+	dom.info.ServerInfoSyncer().RemoveServerInfo()
 	infos, err = infosync.GetAllServerInfo(goCtx)
 	require.NoError(t, err)
 	require.Len(t, infos, 0)
@@ -174,18 +228,29 @@ func TestStatWorkRecoverFromPanic(t *testing.T) {
 	require.NoError(t, err)
 
 	ddlLease := 80 * time.Millisecond
-	dom := NewDomain(store, ddlLease, 0, 0, 0, mockFactory)
+	dom := NewDomain(store, ddlLease, 0, 0, mockFactory)
 
 	metrics.PanicCounter.Reset()
 	// Since the stats lease is 0 now, so create a new ticker will panic.
 	// Test that they can recover from panic correctly.
-	dom.updateStatsWorker(mock.NewContext(), nil)
-	dom.autoAnalyzeWorker(nil)
+	dom.gcStatsWorker()
+	dom.autoAnalyzeWorker()
 	counter := metrics.PanicCounter.WithLabelValues(metrics.LabelDomain)
 	pb := &dto.Metric{}
 	err = counter.Write(pb)
 	require.NoError(t, err)
 	require.Equal(t, float64(2), pb.GetCounter().GetValue())
+
+	// The domain has no stats handle, so each tick of gcStatsWorker panics on a nil pointer.
+	// The worker recovers each panic and keeps running, so stats stay marked as updating.
+	dom.statsLease = 10 * time.Millisecond
+	dom.statsOwner = owner.NewMockManager(context.Background(), "test", store, "stats-owner-test")
+	dom.SetStatsUpdating(true)
+	dom.wg.Run(dom.gcStatsWorker, "gcStatsWorker")
+	require.Eventually(t, func() bool {
+		return counter.Write(pb) == nil && pb.GetCounter().GetValue() >= 4
+	}, 5*time.Second, 10*time.Millisecond)
+	require.True(t, dom.StatsUpdating())
 
 	scope := dom.GetScope("status")
 	require.Equal(t, variable.DefaultStatusVarScopeFlag, scope)
@@ -212,6 +277,44 @@ func TestStatWorkRecoverFromPanic(t *testing.T) {
 	require.True(t, isClose)
 }
 
+func TestUpdateExternalWorkloadTTLJobEnableOnlyFromMaster(t *testing.T) {
+	dom := NewMockDomain()
+	master := &fakeExternalWorkloadManager{role: config.RoleMaster}
+	dom.SetExternalWorkloadManager(master)
+	require.NoError(t, dom.updateExternalWorkloadTTLJobEnable(context.Background(), false))
+	require.NotNil(t, master.updatedValue)
+	require.False(t, *master.updatedValue)
+
+	ttlWorker := &fakeExternalWorkloadManager{role: config.RoleTTLTaskWorker}
+	dom.SetExternalWorkloadManager(ttlWorker)
+	require.NoError(t, dom.updateExternalWorkloadTTLJobEnable(context.Background(), true))
+	require.Nil(t, ttlWorker.updatedValue)
+}
+
+func TestShouldStartTTLJobManagerWithExternalWorkloadRole(t *testing.T) {
+	t.Cleanup(config.RestoreFunc())
+	dom := NewMockDomain()
+	require.True(t, dom.shouldStartTTLJobManager())
+
+	dom.SetExternalWorkloadManager(&fakeExternalWorkloadManager{role: config.RoleMaster})
+	require.False(t, dom.shouldStartTTLJobManager())
+
+	dom.SetExternalWorkloadManager(&fakeExternalWorkloadManager{role: config.RoleTTLTaskWorker})
+	require.True(t, dom.shouldStartTTLJobManager())
+
+	dom.SetExternalWorkloadManager(nil)
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.ExternalWorkload.Enable = true
+		conf.ExternalWorkload.Role = config.RoleMaster
+	})
+	require.False(t, dom.shouldStartTTLJobManager())
+
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.ExternalWorkload.Role = config.RoleTTLTaskWorker
+	})
+	require.False(t, dom.shouldStartTTLJobManager())
+}
+
 // ETCD use ip:port as unix socket address, however this address is invalid on windows.
 // We have to skip some of the test in such case.
 // https://github.com/etcd-io/etcd/blob/f0faa5501d936cd8c9f561bb9d1baca70eb67ab1/pkg/types/urls.go#L42
@@ -228,6 +331,74 @@ func mockFactory() (pools.Resource, error) {
 	return nil, errors.New("mock factory should not be called")
 }
 
+type stmtSummarySysVarContext struct {
+	*mock.Context
+	rows []chunk.Row
+}
+
+func (c *stmtSummarySysVarContext) GetRestrictedSQLExecutor() sqlexec.RestrictedSQLExecutor {
+	return c
+}
+
+func (c *stmtSummarySysVarContext) ExecRestrictedSQL(context.Context, []sqlexec.OptionFuncAlias, string, ...any) ([]chunk.Row, []*resolve.ResultField, error) {
+	return c.rows, nil, nil
+}
+
+// Regression coverage for issue #69913's repeated sysvar-cache rebuild path.
+func TestLoadSysVarCacheLoopReappliesStmtSummaryInternalQuery(t *testing.T) {
+	require.False(t, config.GetGlobalConfig().Instance.StmtSummaryEnablePersistent)
+
+	store, err := mockstore.NewMockStore()
+	require.NoError(t, err)
+	dom := NewDomain(store, 80*time.Millisecond, 0, 0, mockFactory)
+	t.Cleanup(func() {
+		dom.Close()
+		require.NoError(t, store.Close())
+	})
+
+	ctx := &stmtSummarySysVarContext{
+		Context: mock.NewContext(),
+		rows: []chunk.Row{
+			chunk.MutRowFromValues(vardef.TiDBStmtSummaryInternalQuery, vardef.Off).ToRow(),
+			// This lightweight Domain does not start DDL, so keep the MDL callback
+			// from calling its DDL-owned hook while rebuilding unrelated sysvars.
+			chunk.MutRowFromValues(vardef.TiDBEnableMDL, variable.BoolToOnOff(vardef.IsMDLEnabled())).ToRow(),
+		},
+	}
+
+	originalInternalEnabled := stmtsummaryv2.EnabledInternal()
+	t.Cleanup(func() {
+		require.NoError(t, stmtsummaryv2.SetEnableInternalQuery(originalInternalEnabled))
+	})
+	require.NoError(t, stmtsummaryv2.SetEnableInternalQuery(false))
+	require.False(t, stmtsummaryv2.EnabledInternal())
+
+	stmtSummarySysVar := variable.GetSysVar(vardef.TiDBStmtSummaryInternalQuery)
+	require.NotNil(t, stmtSummarySysVar)
+	wrappedStmtSummarySysVar := *stmtSummarySysVar
+	originalSetGlobal := wrappedStmtSummarySysVar.SetGlobal
+	appliedCount := 0
+	wrappedStmtSummarySysVar.SetGlobal = func(ctx context.Context, vars *variable.SessionVars, val string) error {
+		require.Equal(t, vardef.Off, val)
+		appliedCount++
+		return originalSetGlobal(ctx, vars, val)
+	}
+	variable.RegisterSysVar(&wrappedStmtSummarySysVar)
+	t.Cleanup(func() {
+		variable.RegisterSysVar(stmtSummarySysVar)
+	})
+
+	require.NoError(t, dom.LoadSysVarCacheLoop(ctx))
+	require.False(t, stmtsummaryv2.EnabledInternal())
+	require.Equal(t, 1, appliedCount)
+
+	// The persisted and local values both remain OFF. A second rebuild must still
+	// invoke the callback, which runs the internal-summary cleanup path again.
+	require.NoError(t, dom.rebuildSysVarCache(ctx))
+	require.False(t, stmtsummaryv2.EnabledInternal())
+	require.Equal(t, 2, appliedCount)
+}
+
 func sysMockFactory(*Domain) (pools.Resource, error) {
 	return nil, nil
 }
@@ -238,6 +409,10 @@ type mockEtcdBackend struct {
 }
 
 func (mebd *mockEtcdBackend) EtcdAddrs() ([]string, error) {
+	return mebd.pdAddrs, nil
+}
+
+func (mebd *mockEtcdBackend) GetPDAddrs() ([]string, error) {
 	return mebd.pdAddrs, nil
 }
 
@@ -252,39 +427,49 @@ func TestClosestReplicaReadChecker(t *testing.T) {
 	require.NoError(t, err)
 
 	ddlLease := 80 * time.Millisecond
-	dom := NewDomain(store, ddlLease, 0, 0, 0, mockFactory)
+	dom := NewDomain(store, ddlLease, 0, 0, mockFactory)
 	defer func() {
 		dom.Close()
 		require.Nil(t, store.Close())
 	}()
 	dom.sysVarCache.Lock()
 	dom.sysVarCache.global = map[string]string{
-		variable.TiDBReplicaRead: "closest-adaptive",
+		vardef.TiDBReplicaRead: "closest-adaptive",
 	}
 	dom.sysVarCache.Unlock()
+	_, err = infosync.GlobalInfoSyncerInit(context.Background(), "", nil, nil, nil, nil, nil, nil, false, nil)
+	require.NoError(t, err)
 
-	makeFailpointRes := func(v interface{}) string {
+	makeFailpointRes := func(v any) string {
 		bytes, err := json.Marshal(v)
 		require.NoError(t, err)
 		return fmt.Sprintf("return(`%s`)", string(bytes))
 	}
 
-	mockedAllServerInfos := map[string]*infosync.ServerInfo{
+	mockedAllServerInfos := map[string]*serverinfo.ServerInfo{
 		"s1": {
-			ID: "s1",
-			Labels: map[string]string{
-				"zone": "zone1",
+			StaticInfo: serverinfo.StaticInfo{
+				ID: "s1",
+			},
+			DynamicInfo: serverinfo.DynamicInfo{
+				Labels: map[string]string{
+					"zone": "zone1",
+				},
 			},
 		},
 		"s2": {
-			ID: "s2",
-			Labels: map[string]string{
-				"zone": "zone2",
+			StaticInfo: serverinfo.StaticInfo{
+				ID: "s2",
+			},
+			DynamicInfo: serverinfo.DynamicInfo{
+				Labels: map[string]string{
+					"zone": "zone2",
+				},
 			},
 		},
 	}
 
-	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/domain/infosync/mockGetAllServerInfo", makeFailpointRes(mockedAllServerInfos)))
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/domain/serverinfo/mockGetAllServerInfo", makeFailpointRes(mockedAllServerInfos)))
 	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/domain/infosync/mockGetServerInfo", makeFailpointRes(mockedAllServerInfos["s2"])))
 
 	stores := []*metapb.Store{
@@ -343,40 +528,60 @@ func TestClosestReplicaReadChecker(t *testing.T) {
 	}
 
 	// partial matches
-	mockedAllServerInfos = map[string]*infosync.ServerInfo{
+	mockedAllServerInfos = map[string]*serverinfo.ServerInfo{
 		"s1": {
-			ID: "s1",
-			Labels: map[string]string{
-				"zone": "zone1",
+			StaticInfo: serverinfo.StaticInfo{
+				ID: "s1",
+			},
+			DynamicInfo: serverinfo.DynamicInfo{
+				Labels: map[string]string{
+					"zone": "zone1",
+				},
 			},
 		},
 		"s2": {
-			ID: "s2",
-			Labels: map[string]string{
-				"zone": "zone2",
+			StaticInfo: serverinfo.StaticInfo{
+				ID: "s2",
+			},
+			DynamicInfo: serverinfo.DynamicInfo{
+				Labels: map[string]string{
+					"zone": "zone2",
+				},
 			},
 		},
 		"s22": {
-			ID: "s22",
-			Labels: map[string]string{
-				"zone": "zone2",
+			StaticInfo: serverinfo.StaticInfo{
+				ID: "s22",
+			},
+			DynamicInfo: serverinfo.DynamicInfo{
+				Labels: map[string]string{
+					"zone": "zone2",
+				},
 			},
 		},
 		"s3": {
-			ID: "s3",
-			Labels: map[string]string{
-				"zone": "zone3",
+			StaticInfo: serverinfo.StaticInfo{
+				ID: "s3",
+			},
+			DynamicInfo: serverinfo.DynamicInfo{
+				Labels: map[string]string{
+					"zone": "zone3",
+				},
 			},
 		},
 		"s4": {
-			ID: "s4",
-			Labels: map[string]string{
-				"zone": "zone4",
+			StaticInfo: serverinfo.StaticInfo{
+				ID: "s4",
+			},
+			DynamicInfo: serverinfo.DynamicInfo{
+				Labels: map[string]string{
+					"zone": "zone4",
+				},
 			},
 		},
 	}
 	pdClient.stores = stores
-	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/domain/infosync/mockGetAllServerInfo", makeFailpointRes(mockedAllServerInfos)))
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/domain/serverinfo/mockGetAllServerInfo", makeFailpointRes(mockedAllServerInfos)))
 	cases := []struct {
 		id      string
 		matches bool
@@ -411,7 +616,7 @@ func TestClosestReplicaReadChecker(t *testing.T) {
 	}
 
 	variable.SetEnableAdaptiveReplicaRead(true)
-	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/domain/infosync/mockGetAllServerInfo"))
+	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/domain/serverinfo/mockGetAllServerInfo"))
 	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/domain/infosync/mockGetServerInfo"))
 }
 
@@ -421,7 +626,7 @@ type mockInfoPdClient struct {
 	err    error
 }
 
-func (c *mockInfoPdClient) GetAllStores(context.Context, ...pd.GetStoreOption) ([]*metapb.Store, error) {
+func (c *mockInfoPdClient) GetAllStores(context.Context, ...opt.GetStoreOption) ([]*metapb.Store, error) {
 	return c.stores, c.err
 }
 

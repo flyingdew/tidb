@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/expression"
@@ -26,6 +27,7 @@ import (
 	"github.com/pingcap/tidb/pkg/sessiontxn/isolation"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/oracle"
 )
 
 func TestRcTSOCmdCountForPrepareExecuteNormal(t *testing.T) {
@@ -179,7 +181,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	sqlSelectID2, _, _, _ := tk.Session().PrepareStmt("select id1*2 from t1 where id1 = ? for update union select id1*2 from t2 where id1 = ? for update")
 	sqlSelectID3, _, _, _ := tk.Session().PrepareStmt("select * from t1 where id1 = ? for update union select * from t2 where id1 = ?")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		tk.MustExec("begin pessimistic")
 
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlSelectID1, expression.Args2Expressions4Test(1, 2))
@@ -204,7 +206,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	// Join->SelectLock->PoinGet
 	sqlSelectID4, _, _, _ := tk.Session().PrepareStmt("SELECT * FROM t1 JOIN t2 ON t1.id1 = t2.id1 WHERE t1.id1 = ? FOR UPDATE")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		tk.MustExec("begin pessimistic")
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlSelectID4, expression.Args2Expressions4Test(1))
 		require.NoError(t, err)
@@ -241,7 +243,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	// BatchPointGet
 	sqlSelectID6, _, _, _ := tk.Session().PrepareStmt("SELECT * FROM t1 WHERE id1 = ? OR id1 = ? FOR UPDATE")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlSelectID6, expression.Args2Expressions4Test(1, 2))
 		require.NoError(t, err)
@@ -258,7 +260,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	sqlSelectID8, _, _, _ := tk.Session().PrepareStmt("SELECT * FROM t1 JOIN (SELECT * FROM t2 WHERE id1 = ? FOR UPDATE ) tt2 ON t1.id1 = tt2.id1")
 	sqlSelectID9, _, _, _ := tk.Session().PrepareStmt("SELECT (SELECT id1 * 2 FROM t1 WHERE id1 = ? FOR UPDATE)+id1 FROM t2")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlSelectID7, expression.Args2Expressions4Test(10))
 		require.NoError(t, err)
@@ -283,7 +285,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	sqlUpdateID1, _, _, _ := tk.Session().PrepareStmt("UPDATE t1 set id2 = id2 + 100 WHERE id1 = ?")
 	sqlUpdateID2, _, _, _ := tk.Session().PrepareStmt("UPDATE t2 SET id1 = id1 + 100 WHERE id1 = ?")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlUpdateID1, expression.Args2Expressions4Test(1))
 		require.NoError(t, err)
@@ -301,7 +303,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	// SelectLock has PointGet and other plans
 	sqlUpdateID3, _, _, _ := tk.Session().PrepareStmt("UPDATE t1 set id2 = id2 + 100 WHERE id1 IN (SELECT id1 FROM t2 WHERE id1 = ?)")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlUpdateID3, expression.Args2Expressions4Test(1))
 		require.NoError(t, err)
@@ -317,7 +319,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	// PointUpdate doesn't make tso request
 	sqlUpdateID4, _, _, _ := tk.Session().PrepareStmt("UPDATE t1 set id2 = id2 + 100 WHERE id1 =  (SELECT id1 FROM t2 WHERE id1 = ?)")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		tk.MustExec("begin pessimistic")
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlUpdateID4, expression.Args2Expressions4Test(11))
 		require.NoError(t, err)
@@ -334,7 +336,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	sqlDeleteID2, _, _, _ := tk.Session().PrepareStmt("DELETE FROM t1 WHERE id1 > ?")
 	sqlDeleteID3, _, _, _ := tk.Session().PrepareStmt("DELETE FROM t1 WHERE id1 IN (SELECT id1 FROM t2 WHERE id1 = ?)")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 1; i++ {
+	for range 1 {
 		tk.MustExec("begin pessimistic")
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlDeleteID1, expression.Args2Expressions4Test(3))
 		require.NoError(t, err)
@@ -357,7 +359,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	sqlInsertID3, _, _, _ := tk.Session().PrepareStmt("INSERT INTO t1 VALUES(?,5,5) ON DUPLICATE KEY UPDATE id2 = id2 + 100")
 	sqlInsertID4, _, _, _ := tk.Session().PrepareStmt("INSERT INTO t1 VALUES(8,?,5) ON DUPLICATE KEY UPDATE id3 = id3 + 100")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlInsertID2, expression.Args2Expressions4Test(10))
 		require.NoError(t, err)
@@ -382,7 +384,7 @@ func TestRcTSOCmdCountForPrepareExecuteExtra(t *testing.T) {
 	sqlReplaceIntot1, _, _, _ := tk.Session().PrepareStmt("REPLACE INTO t1 VALUES(1, ?, ?)")
 	sqlReplaceIntot2, _, _, _ := tk.Session().PrepareStmt("REPLACE INTO t1 VALUES(?, ?, 20)")
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		tk.MustExec("begin pessimistic")
 		val := i * 11
 		stmt, err := tk.Session().ExecutePreparedStmt(ctx, sqlReplaceIntot1, expression.Args2Expressions4Test(val, val))
@@ -471,18 +473,11 @@ func resetAllTsoCounter(sctx sessionctx.Context) {
 	sctx.SetValue(sessiontxn.TsoWaitCount, 0)
 }
 
-func getAllTsoCounter(sctx sessionctx.Context) (interface{}, interface{}, interface{}) {
+func getAllTsoCounter(sctx sessionctx.Context) (any, any, any) {
 	countTsoRequest := sctx.Value(sessiontxn.TsoRequestCount)
 	countTsoUseConstant := sctx.Value(sessiontxn.TsoUseConstantCount)
 	countWaitTsoOracle := sctx.Value(sessiontxn.TsoWaitCount)
 	return countTsoRequest, countTsoUseConstant, countWaitTsoOracle
-}
-
-func assertAllTsoCounter(t *testing.T,
-	assertPair []uint64) {
-	for i := 0; i < len(assertPair); i += 2 {
-		require.Equal(t, assertPair[i], assertPair[i+1])
-	}
 }
 
 func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
@@ -520,7 +515,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 	// union statements makes disableAdviseWarmup false,
 	// use constant tso when all sub queries of unions are point-lock-read.
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("select * from t1 where id1 = 1 for update union select * from t2 where id1 = 2 for update")
 		tk.MustExec("select id1*2 from t1 where id1 = 1 for update union select id1*2 from t2 where id1 = 2 for update")
@@ -534,7 +529,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 
 	// Join->SelectLock->PoinGet
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("SELECT * FROM t1 JOIN t2 ON t1.id1 = t2.id1 WHERE t1.id1 = 1 FOR UPDATE")
 		tk.MustExec("commit")
@@ -560,7 +555,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 
 	// BatchPointGet
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("SELECT * FROM t1 WHERE id1 = 1 OR id1 = 2 FOR UPDATE")
 		tk.MustExec("commit")
@@ -572,7 +567,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 
 	// Subquery has SelectLock + PointGet
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("SELECT * FROM t1 WHERE id1 IN (SELECT id1 FROM t2 WHERE id1 = 1 FOR UPDATE)")
 		tk.MustExec("SELECT * FROM t1 JOIN (SELECT * FROM t2 WHERE id1 = 1 FOR UPDATE ) tt2 ON t1.id1 = tt2.id1")
@@ -586,7 +581,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 
 	// PointUpdate Index and Non-index
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("UPDATE t1 set id2 = id2 + 100 WHERE id1 = 1")
 		tk.MustExec("UPDATE t2 SET id1 = id1 + 100 WHERE id1 = 1")
@@ -599,7 +594,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 
 	// SelectLock has PointGet and other plans
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("UPDATE t1 set id2 = id2 + 100 WHERE id1 IN (SELECT id1 FROM t2 WHERE id1 = 1)")
 		tk.MustExec("commit")
@@ -612,7 +607,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 	// PointUpdate with singlerow subquery. singlerow subquery makes tso wait
 	// PointUpdate doesn't make tso request
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("UPDATE t1 set id2 = id2 + 100 WHERE id1 =  (SELECT id1 FROM t2 WHERE id1 = 10)")
 		tk.MustExec("commit")
@@ -624,7 +619,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 
 	// insert with select
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 1; i++ {
+	for range 1 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("INSERT INTO t1 VALUES(4,4,4)")
 		tk.MustExec("INSERT INTO t1 SELECT * FROM t2 WHERE id1 = 11")
@@ -637,7 +632,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 
 	// delete
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 1; i++ {
+	for range 1 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("DELETE FROM t1 WHERE id1 = 3")
 		tk.MustExec("DELETE FROM t1 WHERE id1 > 4")
@@ -651,7 +646,7 @@ func TestRcTSOCmdCountForTextSQLExecuteExtra(t *testing.T) {
 
 	// insert on duplicate key
 	resetAllTsoCounter(sctx)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		tk.MustExec("begin pessimistic")
 		tk.MustExec("INSERT INTO t1 VALUES(10,5,5) ON DUPLICATE KEY UPDATE id3 = id3 + 100")
 		tk.MustExec("INSERT INTO t1 VALUES(10,5,5) ON DUPLICATE KEY UPDATE id2 = id2 + 100")
@@ -793,6 +788,7 @@ func TestConflictErrorsUseRcWriteCheckTs(t *testing.T) {
 
 func TestRcWaitTSInSlowLog(t *testing.T) {
 	store := testkit.CreateMockStore(t)
+	oracleWithDelay := setOracleFutureDelay(t, store, time.Millisecond)
 	tk := testkit.NewTestKit(t, store)
 
 	tk.MustExec("set global transaction_isolation = 'READ-COMMITTED'")
@@ -809,13 +805,54 @@ func TestRcWaitTSInSlowLog(t *testing.T) {
 	sctx.SetValue(sessiontxn.TsoRequestCount, 0)
 
 	tk.MustExec("begin pessimistic")
-	waitTs1 := sctx.GetSessionVars().DurationWaitTS
+	sctx.GetSessionVars().DurationWaitTS = 0
 	tk.MustExec("update t1 set id3 = id3 + 10 where id1 = 1")
-	waitTs2 := sctx.GetSessionVars().DurationWaitTS
+	pointUpdateWaitTS := sctx.GetSessionVars().DurationWaitTS
+	secondDelay := pointUpdateWaitTS + time.Millisecond
+	oracleWithDelay.delay = secondDelay
 	tk.MustExec("update t1 set id3 = id3 + 10 where id1 > 3 and id1 < 6")
-	waitTs3 := sctx.GetSessionVars().DurationWaitTS
+	rangeUpdateWaitTS := sctx.GetSessionVars().DurationWaitTS
 	tk.MustExec("commit")
-	require.NotEqual(t, waitTs1, waitTs2)
-	require.NotEqual(t, waitTs1, waitTs2)
-	require.NotEqual(t, waitTs2, waitTs3)
+	require.Greater(t, pointUpdateWaitTS, time.Millisecond)
+	require.GreaterOrEqual(t, rangeUpdateWaitTS, secondDelay)
+}
+
+type oracleSetter interface {
+	GetOracle() oracle.Oracle
+	SetOracle(oracle.Oracle)
+}
+
+func setOracleFutureDelay(t *testing.T, store any, delay time.Duration) *delayedOracle {
+	storage, ok := store.(oracleSetter)
+	require.True(t, ok)
+	originalOracle := storage.GetOracle()
+	oracleWithDelay := &delayedOracle{Oracle: originalOracle, delay: delay}
+	storage.SetOracle(oracleWithDelay)
+	t.Cleanup(func() {
+		storage.SetOracle(originalOracle)
+	})
+	return oracleWithDelay
+}
+
+type delayedOracle struct {
+	oracle.Oracle
+	delay time.Duration
+}
+
+func (o delayedOracle) GetTimestampAsync(ctx context.Context, opt *oracle.Option) oracle.Future {
+	return delayedOracleFuture{Future: o.Oracle.GetTimestampAsync(ctx, opt), delay: o.delay}
+}
+
+func (o delayedOracle) GetLowResolutionTimestampAsync(ctx context.Context, opt *oracle.Option) oracle.Future {
+	return delayedOracleFuture{Future: o.Oracle.GetLowResolutionTimestampAsync(ctx, opt), delay: o.delay}
+}
+
+type delayedOracleFuture struct {
+	oracle.Future
+	delay time.Duration
+}
+
+func (f delayedOracleFuture) Wait() (uint64, error) {
+	time.Sleep(f.delay)
+	return f.Future.Wait()
 }

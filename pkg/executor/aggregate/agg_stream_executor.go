@@ -26,6 +26,11 @@ import (
 	"github.com/pingcap/tidb/pkg/util/memory"
 )
 
+// streamAggMemDeltaFlushThreshold is the threshold for flushing buffered memory delta to the tracker.
+// Consuming memory for every group is expensive due to atomic operations traversing the tracker tree.
+// We buffer deltas across groups and flush in batch to reduce Consume call frequency.
+const streamAggMemDeltaFlushThreshold = 1 << 10 // 1KB
+
 // StreamAggExec deals with all the aggregate functions.
 // It assumes all the input data is sorted by group by key.
 // When Next() is called, it will return a result for the same group.
@@ -49,6 +54,9 @@ type StreamAggExec struct {
 	// All partial results will be reset after processing one group data, and the memory usage should also be reset.
 	// We can't get memory delta from ResetPartialResult, so record the memory usage here.
 	memUsageOfInitialPartialResult int64
+	// pendingMemDelta buffers memory deltas across groups and is flushed to memTracker in batch.
+	// Cleared in appendResult2Chunk via ReplaceBytesUsed, which resets to the correct baseline.
+	pendingMemDelta int64
 }
 
 // Open implements the Executor Open interface.
@@ -64,7 +72,11 @@ func (e *StreamAggExec) Open(ctx context.Context) error {
 	}
 	// If panic in Open, the children executor should be closed because they are open.
 	defer closeBaseExecutor(&e.BaseExecutor)
+	return e.OpenSelf()
+}
 
+// OpenSelf just opens the StreamAggExec.
+func (e *StreamAggExec) OpenSelf() error {
 	e.childResult = exec.TryNewCacheChunk(e.Children(0))
 	e.executed = false
 	e.IsChildReturnEmpty = true
@@ -167,15 +179,23 @@ func (e *StreamAggExec) consumeGroupRows() error {
 	}
 
 	allMemDelta := int64(0)
+	exprCtx := e.Ctx().GetExprCtx()
 	for i, aggFunc := range e.AggFuncs {
-		memDelta, err := aggFunc.UpdatePartialResult(e.Ctx(), e.groupRows, e.partialResults[i])
+		memDelta, err := aggFunc.UpdatePartialResult(exprCtx.GetEvalCtx(), e.groupRows, e.partialResults[i])
 		if err != nil {
 			return err
 		}
 		allMemDelta += memDelta
 	}
 	failpoint.Inject("ConsumeRandomPanic", nil)
-	e.memTracker.Consume(allMemDelta)
+	if allMemDelta != 0 {
+		e.pendingMemDelta += allMemDelta
+		if e.pendingMemDelta >= streamAggMemDeltaFlushThreshold {
+			failpoint.Inject("streamAggMemDeltaFlushForTest", nil)
+			e.memTracker.Consume(e.pendingMemDelta)
+			e.pendingMemDelta = 0
+		}
+	}
 	e.groupRows = e.groupRows[:0]
 	return nil
 }
@@ -214,15 +234,17 @@ func (e *StreamAggExec) consumeCurGroupRowsAndFetchChild(ctx context.Context, ch
 // appendResult2Chunk appends result of all the aggregation functions to the
 // result chunk, and reset the evaluation context for each aggregation.
 func (e *StreamAggExec) appendResult2Chunk(chk *chunk.Chunk) error {
+	exprCtx := e.Ctx().GetExprCtx()
 	for i, aggFunc := range e.AggFuncs {
-		err := aggFunc.AppendFinalResult2Chunk(e.Ctx(), e.partialResults[i], chk)
+		err := aggFunc.AppendFinalResult2Chunk(exprCtx.GetEvalCtx(), e.partialResults[i], chk)
 		if err != nil {
 			return err
 		}
 		aggFunc.ResetPartialResult(e.partialResults[i])
 	}
 	failpoint.Inject("ConsumeRandomPanic", nil)
-	// All partial results have been reset, so reset the memory usage.
+	// All partial results have been reset. Clear pending delta and reset memory to the correct baseline.
+	e.pendingMemDelta = 0
 	e.memTracker.ReplaceBytesUsed(e.childResult.MemoryUsage() + e.memUsageOfInitialPartialResult)
 	if len(e.AggFuncs) == 0 {
 		chk.SetNumVirtualRows(chk.NumRows() + 1)

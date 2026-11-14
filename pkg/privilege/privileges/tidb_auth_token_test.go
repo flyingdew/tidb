@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,7 @@ import (
 	jwsRepo "github.com/lestrrat-go/jwx/v2/jws"
 	jwtRepo "github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/lestrrat-go/jwx/v2/jwt/openid"
+	"github.com/pingcap/tidb/pkg/parser/auth"
 	"github.com/pingcap/tidb/pkg/util/hack"
 	"github.com/stretchr/testify/require"
 )
@@ -155,7 +157,7 @@ yeZMN4+EMse5+0hAhg5UiPHE6pG8RI3zYnp0EYKvN+M9/cdNntyuKCCCvOCi4b4d
 
 type pair struct {
 	name  string
-	value interface{}
+	value any
 }
 
 func init() {
@@ -229,7 +231,7 @@ func init() {
 	}
 }
 
-func getSignedTokenString(priKey *rsa.PrivateKey, pairs map[string]interface{}) (string, error) {
+func getSignedTokenString(priKey *rsa.PrivateKey, pairs map[string]any) (string, error) {
 	jwt := jwtRepo.New()
 	header := jwsRepo.NewHeaders()
 	headerPairs := []pair{
@@ -260,11 +262,100 @@ func getSignedTokenString(priKey *rsa.PrivateKey, pairs map[string]interface{}) 
 	return string(hack.String(bytes)), nil
 }
 
+func TestMatchURIWithWildcard(t *testing.T) {
+	testCases := []struct {
+		name     string
+		required string
+		given    string
+		match    bool
+	}{
+		{
+			name:     "exact URI",
+			required: "spiffe://domain.com/bar/something/foo/baz",
+			given:    "spiffe://domain.com/bar/something/foo/baz",
+			match:    true,
+		},
+		{
+			name:     "whole path segments",
+			required: "spiffe://domain.com/*/something/foo/*",
+			given:    "spiffe://domain.com/bar/something/foo/baz",
+			match:    true,
+		},
+		{
+			name:     "wildcard does not cross path separator",
+			required: "spiffe://domain.com/*/something/foo/*",
+			given:    "spiffe://domain.com/bar/extra/something/foo/baz",
+		},
+		{
+			name:     "wildcard does not match empty segment",
+			required: "spiffe://domain.com/*/something/foo/*",
+			given:    "spiffe://domain.com//something/foo/baz",
+		},
+		{
+			name:     "embedded asterisk is literal",
+			required: "spiffe://domain.com/foo*/bar",
+			given:    "spiffe://domain.com/foo*/bar",
+			match:    true,
+		},
+		{
+			name:     "embedded asterisk does not match partial segment",
+			required: "spiffe://domain.com/foo*/bar",
+			given:    "spiffe://domain.com/foobar/bar",
+		},
+		{
+			name:     "host wildcard is literal",
+			required: "spiffe://*/bar/*",
+			given:    "spiffe://domain.com/bar/baz",
+		},
+		{
+			name:     "scheme must match exactly",
+			required: "spiffe://domain.com/bar/*",
+			given:    "https://domain.com/bar/baz",
+		},
+		{
+			name:     "empty userinfo does not match absent userinfo",
+			required: "spiffe://@domain.com/bar/*",
+			given:    "spiffe://domain.com/bar/baz",
+		},
+		{
+			name:     "absent userinfo does not match empty userinfo",
+			required: "spiffe://domain.com/bar/*",
+			given:    "spiffe://@domain.com/bar/baz",
+		},
+		{
+			name:     "omitted authority does not match present empty authority",
+			required: "spiffe:/bar/*",
+			given:    "spiffe:///bar/baz",
+		},
+		{
+			name:     "present empty authority does not match omitted authority",
+			required: "spiffe:///bar/*",
+			given:    "spiffe:/bar/baz",
+		},
+		{
+			name:     "query wildcard is literal",
+			required: "spiffe://domain.com/bar/*?key=*",
+			given:    "spiffe://domain.com/bar/baz?key=value",
+		},
+		{
+			name:     "encoded slash stays within segment",
+			required: "spiffe://domain.com/bar/*",
+			given:    "spiffe://domain.com/bar/baz%2Fqux",
+			match:    true,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			require.Equal(t, testCase.match, matchURIWithWildcard(testCase.required, testCase.given))
+		})
+	}
+}
+
 func TestAuthTokenClaims(t *testing.T) {
 	var jwksImpl JWKSImpl
 	now := time.Now()
 	require.NoError(t, jwksImpl.LoadJWKS4AuthToken(nil, nil, path[0], time.Hour), path[0])
-	claims := map[string]interface{}{
+	claims := map[string]any{
 		jwsRepo.KeyIDKey:      "the-key-id-0",
 		jwtRepo.SubjectKey:    email1,
 		openid.EmailKey:       email1,
@@ -369,7 +460,7 @@ func TestJWKSImpl(t *testing.T) {
 
 	require.NoError(t, jwksImpl.LoadJWKS4AuthToken(nil, nil, path[0], time.Hour), path[0])
 	now := time.Now()
-	claims := map[string]interface{}{
+	claims := map[string]any{
 		jwsRepo.KeyIDKey:      "the-key-id-0",
 		jwtRepo.SubjectKey:    email1,
 		openid.EmailKey:       email1,
@@ -417,3 +508,76 @@ func TestJWKSImpl(t *testing.T) {
 	_, err = jwksImpl.checkSigWithRetry(signedTokenString, 0)
 	require.Error(t, err)
 }
+
+func (p *MySQLPrivilege) User() []UserRecord {
+	var ret []UserRecord
+	p.user.Ascend(func(itm itemUser) bool {
+		ret = append(ret, itm.data...)
+		return true
+	})
+	slices.SortStableFunc(ret, compareUserRecord)
+	return ret
+}
+
+func (p *MySQLPrivilege) SetUser(user []UserRecord) {
+	p.user.Clear(false)
+	for _, u := range user {
+		old, exists := p.user.Get(itemUser{username: u.User})
+		if !exists {
+			old.username = u.User
+		}
+		old.data = append(old.data, u)
+		p.user.ReplaceOrInsert(old)
+	}
+}
+
+func (p *MySQLPrivilege) DB() []dbRecord {
+	var ret []dbRecord
+	p.db.Ascend(func(itm itemDB) bool {
+		ret = append(ret, itm.data...)
+		return true
+	})
+	return ret
+}
+
+func (p *MySQLPrivilege) TablesPriv() []tablesPrivRecord {
+	var ret []tablesPrivRecord
+	p.tablesPriv.Ascend(func(itm itemTablesPriv) bool {
+		ret = append(ret, itm.data...)
+		return true
+	})
+	return ret
+}
+
+func (p *MySQLPrivilege) ColumnsPriv() []columnsPrivRecord {
+	var ret []columnsPrivRecord
+	p.columnsPriv.Ascend(func(itm itemColumnsPriv) bool {
+		ret = append(ret, itm.data...)
+		return true
+	})
+	return ret
+}
+
+func (p *MySQLPrivilege) DefaultRoles() []defaultRoleRecord {
+	var ret []defaultRoleRecord
+	p.defaultRoles.Ascend(func(itm itemDefaultRole) bool {
+		ret = append(ret, itm.data...)
+		return true
+	})
+	return ret
+}
+
+func (p *MySQLPrivilege) GlobalPriv(user string) []globalPrivRecord {
+	ret, _ := p.globalPriv.Get(itemGlobalPriv{username: user})
+	return ret.data
+}
+
+func (p *MySQLPrivilege) RoleGraph() map[auth.RoleIdentity]roleGraphEdgesTable {
+	return p.roleGraph
+}
+
+func (h *Handle) CheckFullData(t *testing.T, value bool) {
+	require.True(t, h.fullData.Load() == value)
+}
+
+var NewMySQLPrivilege = newMySQLPrivilege

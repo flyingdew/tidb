@@ -34,26 +34,37 @@ func (a testSlice) Less(i, j int) bool { return a[i] < a[j] }
 
 func TestPercentile(t *testing.T) {
 	tests := []aggTest{
-		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeLonglong, 5, nil, 2),
-		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeFloat, 5, nil, 2.0),
-		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeDouble, 5, nil, 2.0),
-		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeNewDecimal, 5, nil, types.NewDecFromFloatForTest(2.0)),
-		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeDate, 5, nil, types.TimeFromDays(367)),
-		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeDuration, 5, nil, types.Duration{Duration: time.Duration(2)}),
+		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeLonglong, 0, 5, nil, 2),
+		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeFloat, 0, 5, nil, 2.0),
+		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeDouble, 0, 5, nil, 2.0),
+		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeNewDecimal, 0, 5, nil, types.NewDecFromFloatForTest(2.0)),
+		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeDate, 0, 5, nil, types.TimeFromDays(367)),
+		buildAggTester(ast.AggFuncApproxPercentile, mysql.TypeDuration, 0, 5, nil, types.Duration{Duration: time.Duration(2)}),
 	}
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("%s_%d", test.funcName, i), func(t *testing.T) {
 			testAggFunc(t, test)
 		})
 	}
+}
 
+func TestFix26807(t *testing.T) {
 	data := testSlice{}
 	want := 28
 	for i := 1; i <= want; i++ {
 		data = append(data, i)
 	}
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		index := aggfuncs.PercentileForTesting(data, 100)
 		require.Equal(t, want, data[index])
+	}
+}
+
+func TestFix40463(t *testing.T) {
+	types := []byte{mysql.TypeEnum, mysql.TypeSet}
+	for _, tp := range types {
+		test := buildAggTester(ast.AggFuncApproxPercentile, tp, 0, 5, nil, nil)
+		test.keyType.AddFlag(mysql.EnumSetAsIntFlag)
+		testAggFunc(t, test)
 	}
 }

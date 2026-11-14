@@ -138,8 +138,19 @@ func (m *MPPCoordinatorManager) Unregister(coordID CoordinatorUniqueID) {
 	}
 }
 
+// GetCoordCount returns the coordinatorMap size
+func (m *MPPCoordinatorManager) GetCoordCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.coordinatorMap)
+}
+
 // ReportStatus reports mpp task execution status to specific coordinator
 func (m *MPPCoordinatorManager) ReportStatus(request *mpp.ReportTaskStatusRequest) *mpp.ReportTaskStatusResponse {
+	if request.Meta == nil {
+		return &mpp.ReportTaskStatusResponse{Error: &mpp.Error{Msg: "missing task metadata"}}
+	}
+
 	mppQueryID := kv.MPPQueryID{
 		QueryTs:      request.Meta.QueryTs,
 		LocalQueryID: request.Meta.LocalQueryId,

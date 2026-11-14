@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/pingcap/tidb/pkg/parser/mysql"
-	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/context"
 )
 
 // calcFraction is used to calculate the fraction of the interval [lower, upper] that lies within the [lower, value]
@@ -43,6 +43,12 @@ func calcFraction(lower, upper, value float64) float64 {
 	return frac
 }
 
+// UTCWithAllowInvalidDateCtx is introduced for the following reason:
+//
+//	Invalid date values may be inserted into table under some relaxed sql mode. Those values may exist in statistics.
+//	Hence, when reading statistics, we should skip invalid date check. See #39336.
+var UTCWithAllowInvalidDateCtx = types.NewContext(types.DefaultStmtFlags|types.FlagIgnoreInvalidDateErr|types.FlagIgnoreZeroInDateErr, time.UTC, context.IgnoreWarn)
+
 func convertDatumToScalar(value *types.Datum, commonPfxLen int) float64 {
 	switch value.Kind() {
 	case types.KindFloat32:
@@ -62,18 +68,7 @@ func convertDatumToScalar(value *types.Datum, commonPfxLen int) float64 {
 		}
 		return scalar
 	case types.KindMysqlTime:
-		valueTime := value.GetMysqlTime()
-		var minTime types.Time
-		switch valueTime.Type() {
-		case mysql.TypeDate:
-			minTime = types.NewTime(types.MinDatetime, mysql.TypeDate, types.DefaultFsp)
-		case mysql.TypeDatetime:
-			minTime = types.NewTime(types.MinDatetime, mysql.TypeDatetime, types.DefaultFsp)
-		case mysql.TypeTimestamp:
-			minTime = types.MinTimestamp
-		}
-		sc := stmtctx.NewStmtCtxWithTimeZone(types.BoundTimezone)
-		return float64(valueTime.Sub(sc.TypeCtx(), &minTime).Duration)
+		return convertMysqlTimeToScalar(value.GetMysqlTime())
 	case types.KindString, types.KindBytes:
 		bytes := value.GetBytes()
 		if len(bytes) <= commonPfxLen {
@@ -90,6 +85,46 @@ func convertDatumToScalar(value *types.Datum, commonPfxLen int) float64 {
 	}
 }
 
+// convertMysqlTimeToScalar maps a types.Time to the float64 scalar used for
+// histogram fraction and out-of-range estimation. The scalar is the duration
+// from the type's minimum bound (MinDatetime for date/datetime, MinTimestamp
+// for timestamp). TIMESTAMP values outside the legal range are clamped just
+// outside the valid scalar range so estimates stay finite and ordered.
+func convertMysqlTimeToScalar(valueTime types.Time) float64 {
+	var minTime types.Time
+	switch valueTime.Type() {
+	case mysql.TypeDate:
+		minTime = types.NewTime(types.MinDatetime, mysql.TypeDate, types.DefaultFsp)
+	case mysql.TypeDatetime:
+		minTime = types.NewTime(types.MinDatetime, mysql.TypeDatetime, types.DefaultFsp)
+	case mysql.TypeTimestamp:
+		minTime = types.MinTimestamp
+		if valueTime.Compare(types.MinTimestamp) < 0 {
+			// Relaxed SQL modes can leave zero TIMESTAMP values in stats. If we
+			// subtract MinTimestamp (1970-01-01 00:00:01) from such a value
+			// directly, GoTime normalizes zero TIMESTAMP to -0001-11-30 and the
+			// subtraction saturates to math.MinInt64 ns. That artificial huge
+			// distance from normal TIMESTAMP values would skew fraction and
+			// out-of-range estimates, so keep before-min values finite and just
+			// before the legal TIMESTAMP range. All before-min values collapse to
+			// the same -1; this is acceptable since they are invalid/zero values
+			// and calcFraction treats value <= lower as 0.
+			return -1
+		}
+		if valueTime.Compare(types.MaxTimestamp) > 0 {
+			// Historical stats may also contain above-max TIMESTAMP bounds. Put
+			// them just after the legal maximum. maxScalar + 1 is not enough here:
+			// at this magnitude float64 rounds it back to maxScalar, collapsing a
+			// [MaxTimestamp, after-max] bucket into a zero-width interval, so use
+			// Nextafter to advance by a single ULP.
+			maxTimestamp := types.MaxTimestamp
+			maxScalar := float64(maxTimestamp.Sub(UTCWithAllowInvalidDateCtx, &minTime).Duration)
+			return math.Nextafter(maxScalar, math.Inf(1))
+		}
+	}
+	return float64(valueTime.Sub(UTCWithAllowInvalidDateCtx, &minTime).Duration)
+}
+
 // PreCalculateScalar converts the lower and upper to scalar. When the datum type is KindString or KindBytes, we also
 // calculate their common prefix length, because when a value falls between lower and upper, the common prefix
 // of lower and upper equals to the common prefix of the lower, upper and the value. For some simple types like `Int64`,
@@ -101,23 +136,26 @@ func (hg *Histogram) PreCalculateScalar() {
 	}
 	switch hg.GetLower(0).Kind() {
 	case types.KindMysqlDecimal, types.KindMysqlTime:
+		var lower, upper types.Datum
 		hg.Scalars = make([]scalar, l)
-		for i := 0; i < l; i++ {
-			hg.Scalars[i] = scalar{
-				lower: convertDatumToScalar(hg.GetLower(i), 0),
-				upper: convertDatumToScalar(hg.GetUpper(i), 0),
-			}
+		for i := range l {
+			// It's read-only, so we don't need to allocate new datum each time.
+			hg.LowerToDatum(i, &lower)
+			hg.UpperToDatum(i, &upper)
+			hg.Scalars[i].lower = convertDatumToScalar(&lower, 0)
+			hg.Scalars[i].upper = convertDatumToScalar(&upper, 0)
 		}
 	case types.KindBytes, types.KindString:
+		var lower, upper types.Datum
 		hg.Scalars = make([]scalar, l)
-		for i := 0; i < l; i++ {
-			lower, upper := hg.GetLower(i), hg.GetUpper(i)
+		for i := range l {
+			// It's read-only, so we don't need to allocate new datum each time.
+			hg.LowerToDatum(i, &lower)
+			hg.UpperToDatum(i, &upper)
 			common := commonPrefixLength(lower.GetBytes(), upper.GetBytes())
-			hg.Scalars[i] = scalar{
-				commonPfxLen: common,
-				lower:        convertDatumToScalar(lower, common),
-				upper:        convertDatumToScalar(upper, common),
-			}
+			hg.Scalars[i].commonPfxLen = common
+			hg.Scalars[i].lower = convertDatumToScalar(&lower, common)
+			hg.Scalars[i].upper = convertDatumToScalar(&upper, common)
 		}
 	}
 }
@@ -153,7 +191,7 @@ func commonPrefixLength(strs ...[]byte) int {
 			minLen = len(str)
 		}
 	}
-	for i := 0; i < minLen; i++ {
+	for i := range minLen {
 		a := strs[0][i]
 		for _, str := range strs {
 			if str[i] != a {
@@ -166,11 +204,37 @@ func commonPrefixLength(strs ...[]byte) int {
 
 func convertBytesToScalar(value []byte) float64 {
 	// Bytes type is viewed as a base-256 value, so we only consider at most 8 bytes.
-	var buf [8]byte
-	copy(buf[:], value)
-	return float64(binary.BigEndian.Uint64(buf[:]))
+	switch len(value) {
+	case 0:
+		return 0
+	case 1:
+		return float64(uint64(value[0]) << 56)
+	case 2:
+		return float64(uint64(value[1])<<48 | uint64(value[0])<<56)
+	case 3:
+		return float64(uint64(value[2])<<40 | uint64(value[1])<<48 | uint64(value[0])<<56)
+	case 4:
+		return float64(
+			uint64(value[3])<<32 | uint64(value[2])<<40 | uint64(value[1])<<48 | uint64(value[0])<<56)
+	case 5:
+		return float64(uint64(value[4])<<24 |
+			uint64(value[3])<<32 | uint64(value[2])<<40 | uint64(value[1])<<48 | uint64(value[0])<<56)
+	case 6:
+		return float64(uint64(value[5])<<16 | uint64(value[4])<<24 |
+			uint64(value[3])<<32 | uint64(value[2])<<40 | uint64(value[1])<<48 | uint64(value[0])<<56)
+	case 7:
+		return float64(uint64(value[6])<<8 | uint64(value[5])<<16 | uint64(value[4])<<24 |
+			uint64(value[3])<<32 | uint64(value[2])<<40 | uint64(value[1])<<48 | uint64(value[0])<<56)
+	default:
+		return float64(binary.BigEndian.Uint64(value))
+	}
 }
 
+// calcFraction4Datums returns the fraction of the interval [lower, upper]
+// that lies within [lower, value], using the continuous-value (uniform-
+// within-bucket) assumption. Used by the global-stats merge to split an
+// input bucket's count proportionally when the bucket straddles a chosen
+// global-bucket boundary.
 func calcFraction4Datums(lower, upper, value *types.Datum) float64 {
 	switch value.Kind() {
 	case types.KindFloat32:
@@ -228,7 +292,7 @@ func EnumRangeValues(low, high types.Datum, lowExclude, highExclude bool) []type
 		if lowExclude {
 			startValue++
 		}
-		for i := int64(0); i < remaining; i++ {
+		for i := range remaining {
 			values = append(values, types.NewIntDatum(startValue+i))
 		}
 		return values
@@ -246,7 +310,7 @@ func EnumRangeValues(low, high types.Datum, lowExclude, highExclude bool) []type
 		if lowExclude {
 			startValue++
 		}
-		for i := uint64(0); i < remaining; i++ {
+		for i := range remaining {
 			values = append(values, types.NewUintDatum(startValue+i))
 		}
 		return values
@@ -264,7 +328,7 @@ func EnumRangeValues(low, high types.Datum, lowExclude, highExclude bool) []type
 			startValue += stepSize
 		}
 		values := make([]types.Datum, 0, remaining)
-		for i := int64(0); i < remaining; i++ {
+		for i := range remaining {
 			values = append(values, types.NewDurationDatum(types.Duration{Duration: time.Duration(startValue + i*stepSize), Fsp: fsp}))
 		}
 		return values
@@ -301,7 +365,7 @@ func EnumRangeValues(low, high types.Datum, lowExclude, highExclude bool) []type
 			}
 		}
 		values := make([]types.Datum, 0, remaining)
-		for i := int64(0); i < remaining; i++ {
+		for i := range remaining {
 			value, err := startValue.Add(typeCtx, types.Duration{Duration: time.Duration(i * stepSize), Fsp: fsp})
 			if err != nil {
 				return nil

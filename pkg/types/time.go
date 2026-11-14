@@ -461,6 +461,13 @@ func (t Time) Convert(ctx Context, tp uint8) (Time, error) {
 
 	t1.SetType(tp)
 	err := t1.Check(ctx)
+	if tp == mysql.TypeTimestamp && ErrTimestampInDSTTransition.Equal(err) {
+		tAdj, adjErr := t1.AdjustedGoTime(ctx.Location())
+		if adjErr == nil {
+			ctx.AppendWarning(err)
+			return Time{FromGoTime(tAdj)}, nil
+		}
+	}
 	return t1, errors.Trace(err)
 }
 
@@ -576,7 +583,10 @@ func GetFsp(s string) int {
 
 // GetFracIndex finds the last '.' for get fracStr, index = -1 means fracStr not found.
 // but for format like '2019.01.01 00:00:00', the index should be -1.
-// It will not be affected by the time zone suffix. For format like '2020-01-01 12:00:00.123456+05:00', the index should be 19.
+//
+// It will not be affected by the time zone suffix.
+// For format like '2020-01-01 12:00:00.123456+05:00' and `2020-01-01 12:00:00.123456-05:00`, the index should be 19.
+// related issue https://github.com/pingcap/tidb/issues/35291 and https://github.com/pingcap/tidb/issues/49555
 func GetFracIndex(s string) (index int) {
 	tzIndex, _, _, _, _ := GetTimezone(s)
 	var end int
@@ -587,7 +597,7 @@ func GetFracIndex(s string) (index int) {
 	}
 	index = -1
 	for i := end; i >= 0; i-- {
-		if unicode.IsPunct(rune(s[i])) {
+		if s[i] != '+' && s[i] != '-' && isPunctuation(s[i]) {
 			if s[i] == '.' {
 				index = i
 			}
@@ -692,9 +702,9 @@ func (t *Time) Sub(ctx Context, t1 *Time) Duration {
 	var duration gotime.Duration
 	if t.Type() == mysql.TypeTimestamp && t1.Type() == mysql.TypeTimestamp {
 		a, err := t.GoTime(ctx.Location())
-		terror.Log(errors.Trace(err))
+		logTimeSubGoTimeErr(ctx, err)
 		b, err := t1.GoTime(ctx.Location())
-		terror.Log(errors.Trace(err))
+		logTimeSubGoTimeErr(ctx, err)
 		duration = a.Sub(b)
 	} else {
 		seconds, microseconds, neg := calcTimeTimeDiff(t.coreTime, t1.coreTime, 1)
@@ -715,6 +725,22 @@ func (t *Time) Sub(ctx Context, t1 *Time) Duration {
 	}
 }
 
+// logTimeSubGoTimeErr logs a GoTime conversion error produced by Time.Sub for
+// TIMESTAMP operands. Such errors are expected when the context tolerates
+// invalid/zero dates (e.g. zero TIMESTAMP values read from stats under relaxed
+// SQL modes), and are suppressed there to avoid log noise; in strict contexts
+// the original terror.Log behavior is preserved.
+func logTimeSubGoTimeErr(ctx Context, err error) {
+	if err == nil {
+		return
+	}
+	flags := ctx.Flags()
+	if flags.IgnoreInvalidDateErr() || flags.IgnoreZeroInDate() {
+		return
+	}
+	terror.Log(errors.Trace(err))
+}
+
 // Add adds d to t, returns the result time value.
 func (t *Time) Add(ctx Context, d Duration) (Time, error) {
 	seconds, microseconds, _ := calcTimeDurationDiff(t.coreTime, d)
@@ -731,10 +757,7 @@ func (t *Time) Add(ctx Context, d Duration) (Time, error) {
 		tm.setSecond(0)
 		tm.setMicrosecond(0)
 	}
-	fsp := t.Fsp()
-	if d.Fsp > fsp {
-		fsp = d.Fsp
-	}
+	fsp := max(d.Fsp, t.Fsp())
 	ret := NewTime(tm.coreTime, t.Type(), fsp)
 	return ret, ret.Check(ctx)
 }
@@ -942,7 +965,7 @@ func splitDateTime(format string) (seps []string, fracStr string, hasTZ bool, tz
 }
 
 // See https://dev.mysql.com/doc/refman/5.7/en/date-and-time-literals.html.
-func parseDatetime(ctx Context, str string, fsp int, isFloat bool) (Time, error) {
+func parseDatetime(ctx Context, str String, fsp int, isFloat bool) (Time, error) {
 	var (
 		year, month, day, hour, minute, second, deltaHour, deltaMinute int
 		fracStr                                                        string
@@ -951,9 +974,10 @@ func parseDatetime(ctx Context, str string, fsp int, isFloat bool) (Time, error)
 		err                                                            error
 	)
 
-	seps, fracStr, hasTZ, tzSign, tzHour, tzSep, tzMinute, truncatedOrIncorrect := splitDateTime(str)
+	rawStr := str.String()
+	seps, fracStr, hasTZ, tzSign, tzHour, tzSep, tzMinute, truncatedOrIncorrect := splitDateTime(rawStr)
 	if truncatedOrIncorrect {
-		ctx.AppendWarning(ErrTruncatedWrongVal.GenWithStackByArgs("datetime", str))
+		ctx.AppendWarning(ErrTruncatedWrongVal.FastGenByArgs("datetime", str))
 	}
 	/*
 		if we have timezone parsed, there are the following cases to be considered, however some of them are wrongly parsed, and we should consider absorb them back to seps.
@@ -1116,11 +1140,11 @@ func parseDatetime(ctx Context, str string, fsp int, isFloat bool) (Time, error)
 			truncatedOrIncorrect = err != nil
 		}
 		if truncatedOrIncorrect {
-			ctx.AppendWarning(ErrTruncatedWrongVal.GenWithStackByArgs("datetime", str))
+			ctx.AppendWarning(ErrTruncatedWrongVal.FastGenByArgs("datetime", str))
 			err = nil
 		}
 	case 2:
-		return ZeroDatetime, errors.Trace(ErrWrongValue.GenWithStackByArgs(DateTimeStr, str))
+		return ZeroDatetime, errors.Trace(ErrWrongValue.FastGenByArgs(DateTimeStr, str))
 	case 3:
 		// YYYY-MM-DD
 		err = scanTimeArgs(seps, &year, &month, &day)
@@ -1139,7 +1163,7 @@ func parseDatetime(ctx Context, str string, fsp int, isFloat bool) (Time, error)
 		// For case like `2020-05-28 23:59:59 00:00:00`, the seps should be > 6, the reluctant parts should be truncated.
 		seps = seps[:6]
 		// YYYY-MM-DD HH-MM-SS
-		ctx.AppendWarning(ErrTruncatedWrongVal.GenWithStackByArgs("datetime", str))
+		ctx.AppendWarning(ErrTruncatedWrongVal.FastGenByArgs("datetime", str))
 		err = scanTimeArgs(seps, &year, &month, &day, &hour, &minute, &second)
 		hhmmss = true
 	}
@@ -1982,6 +2006,13 @@ func parseDateTimeFromNum(ctx Context, num int64) (Time, error) {
 // The valid date range is from '1000-01-01' to '9999-12-31'
 // explicitTz is used to handle a data race of timeZone, refer to https://github.com/pingcap/tidb/issues/40710. It only works for timestamp now, be careful to use it!
 func ParseTime(ctx Context, str string, tp byte, fsp int) (Time, error) {
+	return ParseTimeWithString(ctx, PlainStr(str), tp, fsp)
+}
+
+// ParseTimeWithString parses a formatted string with type tp and specific fsp.
+// The string wrapper allows callers to mark unsafe string sources so warning/error
+// arguments are frozen before deferred formatting.
+func ParseTimeWithString(ctx Context, str String, tp byte, fsp int) (Time, error) {
 	return parseTime(ctx, str, tp, fsp, false)
 }
 
@@ -1991,10 +2022,10 @@ func ParseTimeFromFloatString(ctx Context, str string, tp byte, fsp int) (Time, 
 	if len(str) >= 3 && str[:3] == "0.0" {
 		return NewTime(ZeroCoreTime, tp, DefaultFsp), nil
 	}
-	return parseTime(ctx, str, tp, fsp, true)
+	return parseTime(ctx, PlainStr(str), tp, fsp, true)
 }
 
-func parseTime(ctx Context, str string, tp byte, fsp int, isFloat bool) (Time, error) {
+func parseTime(ctx Context, str String, tp byte, fsp int, isFloat bool) (Time, error) {
 	fsp, err := CheckFsp(fsp)
 	if err != nil {
 		return NewTime(ZeroCoreTime, tp, DefaultFsp), errors.Trace(err)
@@ -2007,9 +2038,33 @@ func parseTime(ctx Context, str string, tp byte, fsp int, isFloat bool) (Time, e
 
 	t.SetType(tp)
 	if err = t.Check(ctx); err != nil {
+		if tp == mysql.TypeTimestamp && !t.IsZero() {
+			tAdjusted, errAdjusted := adjustTimestampErrForDST(ctx.Location(), str, tp, t, err)
+			if ErrTimestampInDSTTransition.Equal(errAdjusted) {
+				return tAdjusted, errors.Trace(errAdjusted)
+			}
+		}
 		return NewTime(ZeroCoreTime, tp, DefaultFsp), errors.Trace(err)
 	}
 	return t, nil
+}
+
+func adjustTimestampErrForDST(loc *gotime.Location, str String, tp byte, t Time, err error) (Time, error) {
+	if tp != mysql.TypeTimestamp || t.IsZero() {
+		return t, err
+	}
+	minTS, maxTS := MinTimestamp, MaxTimestamp
+	minErr := minTS.ConvertTimeZone(gotime.UTC, loc)
+	maxErr := maxTS.ConvertTimeZone(gotime.UTC, loc)
+	if minErr == nil && maxErr == nil &&
+		t.Compare(minTS) > 0 && t.Compare(maxTS) < 0 {
+		// Handle the case when the timestamp given is in the DST transition
+		if tAdjusted, err2 := t.AdjustedGoTime(loc); err2 == nil {
+			t.SetCoreTime(FromGoTime(tAdjusted))
+			return t, errors.Trace(ErrTimestampInDSTTransition.GenWithStackByArgs(str, loc.String()))
+		}
+	}
+	return t, err
 }
 
 // ParseDatetime is a helper function wrapping ParseTime with datetime type and default fsp.
@@ -2168,7 +2223,8 @@ func checkTimestampType(t CoreTime, tz *gotime.Location) error {
 		convertTime := NewTime(t, mysql.TypeTimestamp, DefaultFsp)
 		err := convertTime.ConvertTimeZone(tz, BoundTimezone)
 		if err != nil {
-			return err
+			_, err2 := adjustTimestampErrForDST(tz, PlainStr(t.String()), mysql.TypeTimestamp, Time{t}, err)
+			return err2
 		}
 		checkTime = convertTime.coreTime
 	} else {
@@ -2666,7 +2722,7 @@ func ParseTimeFromFloat64(ctx Context, f float64) (Time, error) {
 	}
 	if t.Type() == mysql.TypeDatetime {
 		// US part is only kept when the integral part is recognized as datetime.
-		fracPart := uint32((f - float64(intPart)) * 1000000.0)
+		fracPart := uint32(math.Round((f - float64(intPart)) * 1000000.0))
 		ct := t.CoreTime()
 		ct.setMicrosecond(fracPart)
 		t.SetCoreTime(ct)
@@ -2917,7 +2973,7 @@ func (t *Time) StrToDate(typeCtx Context, date, format string) bool {
 	if warning {
 		// Only append this warning when success but still need warning.
 		// Currently this only happens when `date` has extra characters at the end.
-		typeCtx.AppendWarning(ErrTruncatedWrongVal.GenWithStackByArgs(DateTimeStr, date))
+		typeCtx.AppendWarning(ErrTruncatedWrongVal.FastGenByArgs(DateTimeStr, date))
 	}
 	return true
 }

@@ -16,19 +16,29 @@ package executor
 
 import (
 	"context"
+	"encoding/hex"
+	"slices"
 
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/metrics"
+	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
+	"github.com/pingcap/tidb/pkg/planner/core/base"
+	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
+	"github.com/pingcap/tidb/pkg/planner/core/resolve"
 	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/sessiontxn"
 	"github.com/pingcap/tidb/pkg/sessiontxn/staleread"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
 	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/pingcap/tidb/pkg/util/redact"
+	"github.com/pingcap/tidb/pkg/util/traceevent"
 	"github.com/pingcap/tidb/pkg/util/tracing"
 	"go.uber.org/zap"
 )
@@ -56,17 +66,18 @@ func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (_ *ExecS
 			panic(r)
 		}
 		err = recoveredErr
-		logutil.Logger(ctx).Error("compile SQL panic", zap.String("SQL", stmtNode.Text()), zap.Stack("stack"), zap.Any("recover", r))
+		logutil.Logger(ctx).Error("compile SQL panic", zap.String("SQL", parser.Normalize(stmtNode.Text(), c.Ctx.GetSessionVars().EnableRedactLog)), zap.Stack("stack"), zap.Any("recover", r))
 	}()
 
 	c.Ctx.GetSessionVars().StmtCtx.IsReadOnly = plannercore.IsReadOnly(stmtNode, c.Ctx.GetSessionVars())
 
 	// Do preprocess and validate.
 	ret := &plannercore.PreprocessorReturn{}
+	nodeW := resolve.NewNodeW(stmtNode)
 	err = plannercore.Preprocess(
 		ctx,
 		c.Ctx,
-		stmtNode,
+		nodeW,
 		plannercore.WithPreprocessorReturn(ret),
 		plannercore.InitTxnContextProvider,
 	)
@@ -87,21 +98,23 @@ func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (_ *ExecS
 	sessVars := c.Ctx.GetSessionVars()
 	stmtCtx := sessVars.StmtCtx
 	// handle the execute statement
-	var (
-		pointGetPlanShortPathOK bool
-		preparedObj             *plannercore.PlanCacheStmt
-	)
+	var preparedObj *plannercore.PlanCacheStmt
 
 	if execStmt, ok := stmtNode.(*ast.ExecuteStmt); ok {
 		if preparedObj, err = plannercore.GetPreparedStmt(execStmt, sessVars); err != nil {
 			return nil, err
 		}
-		if pointGetPlanShortPathOK, err = plannercore.IsPointGetPlanShortPathOK(c.Ctx, is, preparedObj); err != nil {
-			return nil, err
-		}
+	}
+	// CREATE MATERIALIZED VIEW plans its SELECT during DDL build; avoid strict-mode TiFlash removal for that step.
+	if _, ok := stmtNode.(*ast.CreateMaterializedViewStmt); ok {
+		origMVMaintenance := sessVars.InMViewMaintenance
+		sessVars.InMViewMaintenance = true
+		defer func() {
+			sessVars.InMViewMaintenance = origMVMaintenance
+		}()
 	}
 	// Build the final physical plan.
-	finalPlan, names, err := planner.Optimize(ctx, c.Ctx, stmtNode, is)
+	finalPlan, names, err := planner.Optimize(ctx, c.Ctx, nodeW, is)
 	if err != nil {
 		return nil, err
 	}
@@ -111,37 +124,50 @@ func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (_ *ExecS
 	})
 
 	if preparedObj != nil {
-		CountStmtNode(preparedObj.PreparedAst.Stmt, sessVars.InRestrictedSQL)
+		CountStmtNode(ctx, preparedObj.PreparedAst.Stmt, preparedObj.ResolveCtx, sessVars.InRestrictedSQL, stmtCtx.ResourceGroupName)
 	} else {
-		CountStmtNode(stmtNode, sessVars.InRestrictedSQL)
+		CountStmtNode(ctx, stmtNode, nodeW.GetResolveContext(), sessVars.InRestrictedSQL, stmtCtx.ResourceGroupName)
 	}
 	var lowerPriority bool
 	if c.Ctx.GetSessionVars().StmtCtx.Priority == mysql.NoPriority {
 		lowerPriority = needLowerPriority(finalPlan)
 	}
 	stmtCtx.SetPlan(finalPlan)
+
+	// Emit trace event for plan digest if enabled
+	if traceevent.IsEnabled(traceevent.StmtPlan) {
+		normalized, planDigest := stmtCtx.GetPlanDigest()
+		var digestHex string
+		if planDigest != nil {
+			digestHex = hex.EncodeToString(planDigest.Bytes())
+		}
+		fields := []zap.Field{
+			zap.String("plan_digest", digestHex),
+			zap.String("stmt_type", stmtctx.GetStmtLabel(ctx, stmtNode)),
+			zap.Uint64("conn_id", sessVars.ConnectionID),
+		}
+		// Add normalized plan if present, respecting redaction
+		if normalized != "" {
+			fields = append(fields, zap.String("normalized_plan", redact.String(sessVars.EnableRedactLog, normalized)))
+		}
+		traceevent.TraceEvent(ctx, traceevent.StmtPlan, "stmt.plan.digest", fields...)
+	}
+
 	stmt := &ExecStmt{
 		GoCtx:         ctx,
 		InfoSchema:    is,
 		Plan:          finalPlan,
 		LowerPriority: lowerPriority,
-		Text:          stmtNode.Text(),
 		StmtNode:      stmtNode,
 		Ctx:           c.Ctx,
 		OutputNames:   names,
 		Ti:            &TelemetryInfo{},
 	}
 	// Use cached plan if possible.
-	if pointGetPlanShortPathOK {
-		if ep, ok := stmt.Plan.(*plannercore.Execute); ok {
-			if pointPlan, ok := ep.Plan.(*plannercore.PointGetPlan); ok {
-				stmtCtx.SetPlan(stmt.Plan)
-				stmtCtx.SetPlanDigest(preparedObj.NormalizedPlan, preparedObj.PlanDigest)
-				stmt.Plan = pointPlan
-				stmt.PsStmt = preparedObj
-			} else {
-				// invalid the previous cached point plan
-				preparedObj.PreparedAst.CachedPlan = nil
+	if preparedObj != nil && plannercore.IsSafeToReusePointGetExecutor(c.Ctx, is, preparedObj) {
+		if exec, isExec := finalPlan.(*plannercore.Execute); isExec {
+			if pointPlan, isPointPlan := exec.Plan.(*physicalop.PointGetPlan); isPointPlan {
+				stmt.PsStmt, stmt.Plan = preparedObj, pointPlan // notify to re-use the cached plan
 			}
 		}
 	}
@@ -150,6 +176,11 @@ func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (_ *ExecS
 	if err = sessiontxn.AdviseOptimizeWithPlanAndThenWarmUp(c.Ctx, stmt.Plan); err != nil {
 		return nil, err
 	}
+	// Statement RU collection is only supported by the NextGen kernel.
+	if kerneltype.IsNextGen() {
+		installStatementRUOwner(stmt)
+	}
+	failpoint.InjectCall("observeStatementRUOwnerInstallForTest", stmt)
 
 	return stmt, nil
 }
@@ -159,21 +190,21 @@ func (c *Compiler) Compile(ctx context.Context, stmtNode ast.StmtNode) (_ *ExecS
 // If the estimated output row count of any operator in the physical plan tree
 // is greater than the specific threshold, we'll set it to lowPriority when
 // sending it to the coprocessor.
-func needLowerPriority(p plannercore.Plan) bool {
+func needLowerPriority(p base.Plan) bool {
 	switch x := p.(type) {
-	case plannercore.PhysicalPlan:
+	case base.PhysicalPlan:
 		return isPhysicalPlanNeedLowerPriority(x)
 	case *plannercore.Execute:
 		return needLowerPriority(x.Plan)
-	case *plannercore.Insert:
+	case *physicalop.Insert:
 		if x.SelectPlan != nil {
 			return isPhysicalPlanNeedLowerPriority(x.SelectPlan)
 		}
-	case *plannercore.Delete:
+	case *physicalop.Delete:
 		if x.SelectPlan != nil {
 			return isPhysicalPlanNeedLowerPriority(x.SelectPlan)
 		}
-	case *plannercore.Update:
+	case *physicalop.Update:
 		if x.SelectPlan != nil {
 			return isPhysicalPlanNeedLowerPriority(x.SelectPlan)
 		}
@@ -181,31 +212,25 @@ func needLowerPriority(p plannercore.Plan) bool {
 	return false
 }
 
-func isPhysicalPlanNeedLowerPriority(p plannercore.PhysicalPlan) bool {
+func isPhysicalPlanNeedLowerPriority(p base.PhysicalPlan) bool {
 	expensiveThreshold := int64(config.GetGlobalConfig().Log.ExpensiveThreshold)
 	if int64(p.StatsCount()) > expensiveThreshold {
 		return true
 	}
 
-	for _, child := range p.Children() {
-		if isPhysicalPlanNeedLowerPriority(child) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(p.Children(), isPhysicalPlanNeedLowerPriority)
 }
 
 // CountStmtNode records the number of statements with the same type.
-func CountStmtNode(stmtNode ast.StmtNode, inRestrictedSQL bool) {
+func CountStmtNode(ctx context.Context, stmtNode ast.StmtNode, resolveCtx *resolve.Context, inRestrictedSQL bool, resourceGroup string) {
 	if inRestrictedSQL {
 		return
 	}
 
-	typeLabel := ast.GetStmtLabel(stmtNode)
+	typeLabel := stmtctx.GetStmtLabel(ctx, stmtNode)
 
 	if config.GetGlobalConfig().Status.RecordQPSbyDB || config.GetGlobalConfig().Status.RecordDBLabel {
-		dbLabels := getStmtDbLabel(stmtNode)
+		dbLabels := getStmtDbLabel(stmtNode, resolveCtx)
 		switch {
 		case config.GetGlobalConfig().Status.RecordQPSbyDB:
 			for dbLabel := range dbLabels {
@@ -213,80 +238,80 @@ func CountStmtNode(stmtNode ast.StmtNode, inRestrictedSQL bool) {
 			}
 		case config.GetGlobalConfig().Status.RecordDBLabel:
 			for dbLabel := range dbLabels {
-				metrics.StmtNodeCounter.WithLabelValues(typeLabel, dbLabel).Inc()
+				metrics.StmtNodeCounter.WithLabelValues(typeLabel, dbLabel, resourceGroup).Inc()
 			}
 		}
 	} else {
-		metrics.StmtNodeCounter.WithLabelValues(typeLabel, "").Inc()
+		metrics.StmtNodeCounter.WithLabelValues(typeLabel, "", resourceGroup).Inc()
 	}
 }
 
-func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
+func getStmtDbLabel(stmtNode ast.StmtNode, resolveCtx *resolve.Context) map[string]struct{} {
 	dbLabelSet := make(map[string]struct{})
 
 	switch x := stmtNode.(type) {
 	case *ast.AlterTableStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.CreateIndexStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.CreateTableStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.InsertStmt:
 		var dbLabels []string
 		if x.Table != nil {
-			dbLabels = getDbFromResultNode(x.Table.TableRefs)
+			dbLabels = getDbFromResultNode(x.Table.TableRefs, resolveCtx)
 			for _, db := range dbLabels {
 				dbLabelSet[db] = struct{}{}
 			}
 		}
-		dbLabels = getDbFromResultNode(x.Select)
+		dbLabels = getDbFromResultNode(x.Select, resolveCtx)
 		for _, db := range dbLabels {
 			dbLabelSet[db] = struct{}{}
 		}
 	case *ast.DropIndexStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.TruncateTableStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.RepairTableStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.FlashBackTableStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.RecoverTableStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.CreateViewStmt:
 		if x.ViewName != nil {
-			dbLabel := x.ViewName.Schema.O
+			dbLabel := x.ViewName.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.RenameTableStmt:
 		tables := x.TableToTables
 		for _, table := range tables {
 			if table.OldTable != nil {
-				dbLabel := table.OldTable.Schema.O
+				dbLabel := table.OldTable.Schema.L
 				if _, ok := dbLabelSet[dbLabel]; !ok {
 					dbLabelSet[dbLabel] = struct{}{}
 				}
@@ -295,70 +320,75 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 	case *ast.DropTableStmt:
 		tables := x.Tables
 		for _, table := range tables {
-			dbLabel := table.Schema.O
+			dbLabel := table.Schema.L
 			if _, ok := dbLabelSet[dbLabel]; !ok {
 				dbLabelSet[dbLabel] = struct{}{}
 			}
 		}
 	case *ast.SelectStmt:
-		dbLabels := getDbFromResultNode(x)
+		dbLabels := getDbFromResultNode(x, resolveCtx)
 		for _, db := range dbLabels {
 			dbLabelSet[db] = struct{}{}
 		}
 	case *ast.SetOprStmt:
-		dbLabels := getDbFromResultNode(x)
+		dbLabels := getDbFromResultNode(x, resolveCtx)
 		for _, db := range dbLabels {
 			dbLabelSet[db] = struct{}{}
 		}
 	case *ast.UpdateStmt:
 		if x.TableRefs != nil {
-			dbLabels := getDbFromResultNode(x.TableRefs.TableRefs)
+			dbLabels := getDbFromResultNode(x.TableRefs.TableRefs, resolveCtx)
 			for _, db := range dbLabels {
 				dbLabelSet[db] = struct{}{}
 			}
 		}
 	case *ast.DeleteStmt:
 		if x.TableRefs != nil {
-			dbLabels := getDbFromResultNode(x.TableRefs.TableRefs)
+			dbLabels := getDbFromResultNode(x.TableRefs.TableRefs, resolveCtx)
 			for _, db := range dbLabels {
 				dbLabelSet[db] = struct{}{}
 			}
 		}
 	case *ast.CallStmt:
 		if x.Procedure != nil {
-			dbLabel := x.Procedure.Schema.O
+			dbLabel := x.Procedure.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.ShowStmt:
 		dbLabelSet[x.DBName] = struct{}{}
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.LoadDataStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.ImportIntoStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.SplitRegionStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
+			dbLabelSet[dbLabel] = struct{}{}
+		}
+	case *ast.DistributeTableStmt:
+		if x.Table != nil {
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.NonTransactionalDMLStmt:
 		if x.ShardColumn != nil {
-			dbLabel := x.ShardColumn.Schema.O
+			dbLabel := x.ShardColumn.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.AnalyzeTableStmt:
 		tables := x.TableNames
 		for _, table := range tables {
-			dbLabel := table.Schema.O
+			dbLabel := table.Schema.L
 			if _, ok := dbLabelSet[dbLabel]; !ok {
 				dbLabelSet[dbLabel] = struct{}{}
 			}
@@ -366,7 +396,7 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 	case *ast.DropStatsStmt:
 		tables := x.Tables
 		for _, table := range tables {
-			dbLabel := table.Schema.O
+			dbLabel := table.Schema.L
 			if _, ok := dbLabelSet[dbLabel]; !ok {
 				dbLabelSet[dbLabel] = struct{}{}
 			}
@@ -374,7 +404,7 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 	case *ast.AdminStmt:
 		tables := x.Tables
 		for _, table := range tables {
-			dbLabel := table.Schema.O
+			dbLabel := table.Schema.L
 			if _, ok := dbLabelSet[dbLabel]; !ok {
 				dbLabelSet[dbLabel] = struct{}{}
 			}
@@ -386,14 +416,14 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 	case *ast.FlushStmt:
 		tables := x.Tables
 		for _, table := range tables {
-			dbLabel := table.Schema.O
+			dbLabel := table.Schema.L
 			if _, ok := dbLabelSet[dbLabel]; !ok {
 				dbLabelSet[dbLabel] = struct{}{}
 			}
 		}
 	case *ast.CompactTableStmt:
 		if x.Table != nil {
-			dbLabel := x.Table.Schema.O
+			dbLabel := x.Table.Schema.L
 			dbLabelSet[dbLabel] = struct{}{}
 		}
 	case *ast.CreateBindingStmt:
@@ -415,7 +445,7 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 			} else {
 				resNode = nil
 			}
-			dbLabels := getDbFromResultNode(resNode)
+			dbLabels := getDbFromResultNode(resNode, resolveCtx)
 			for _, db := range dbLabels {
 				dbLabelSet[db] = struct{}{}
 			}
@@ -436,7 +466,7 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 			} else {
 				resNode = nil
 			}
-			dbLabels := getDbFromResultNode(resNode)
+			dbLabels := getDbFromResultNode(resNode, resolveCtx)
 			for _, db := range dbLabels {
 				dbLabelSet[db] = struct{}{}
 			}
@@ -460,7 +490,7 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 			} else {
 				resNode = nil
 			}
-			dbLabels := getDbFromResultNode(resNode)
+			dbLabels := getDbFromResultNode(resNode, resolveCtx)
 			for _, db := range dbLabels {
 				dbLabelSet[db] = struct{}{}
 			}
@@ -481,7 +511,7 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 			} else {
 				resNode = nil
 			}
-			dbLabels := getDbFromResultNode(resNode)
+			dbLabels := getDbFromResultNode(resNode, resolveCtx)
 			for _, db := range dbLabels {
 				dbLabelSet[db] = struct{}{}
 			}
@@ -505,7 +535,7 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 			} else {
 				resNode = nil
 			}
-			dbLabels := getDbFromResultNode(resNode)
+			dbLabels := getDbFromResultNode(resNode, resolveCtx)
 			for _, db := range dbLabels {
 				dbLabelSet[db] = struct{}{}
 			}
@@ -527,7 +557,7 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 			} else {
 				resNode = nil
 			}
-			dbLabels := getDbFromResultNode(resNode)
+			dbLabels := getDbFromResultNode(resNode, resolveCtx)
 			for _, db := range dbLabels {
 				dbLabelSet[db] = struct{}{}
 			}
@@ -542,7 +572,7 @@ func getStmtDbLabel(stmtNode ast.StmtNode) map[string]struct{} {
 	return dbLabelSet
 }
 
-func getDbFromResultNode(resultNode ast.ResultSetNode) []string { // may have duplicate db name
+func getDbFromResultNode(resultNode ast.ResultSetNode, resolveCtx *resolve.Context) []string { // may have duplicate db name
 	var dbLabels []string
 
 	if resultNode == nil {
@@ -551,25 +581,26 @@ func getDbFromResultNode(resultNode ast.ResultSetNode) []string { // may have du
 
 	switch x := resultNode.(type) {
 	case *ast.TableSource:
-		return getDbFromResultNode(x.Source)
+		return getDbFromResultNode(x.Source, resolveCtx)
 	case *ast.SelectStmt:
 		if x.From != nil {
-			return getDbFromResultNode(x.From.TableRefs)
+			return getDbFromResultNode(x.From.TableRefs, resolveCtx)
 		}
 	case *ast.TableName:
-		if x.DBInfo != nil {
-			dbLabels = append(dbLabels, x.DBInfo.Name.O)
+		xW := resolveCtx.GetTableName(x)
+		if xW != nil {
+			dbLabels = append(dbLabels, xW.DBInfo.Name.L)
 		}
 	case *ast.Join:
 		if x.Left != nil {
-			dbs := getDbFromResultNode(x.Left)
+			dbs := getDbFromResultNode(x.Left, resolveCtx)
 			if dbs != nil {
 				dbLabels = append(dbLabels, dbs...)
 			}
 		}
 
 		if x.Right != nil {
-			dbs := getDbFromResultNode(x.Right)
+			dbs := getDbFromResultNode(x.Right, resolveCtx)
 			if dbs != nil {
 				dbLabels = append(dbLabels, dbs...)
 			}

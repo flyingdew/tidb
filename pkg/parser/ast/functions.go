@@ -21,7 +21,6 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/parser/format"
-	"github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/types"
 )
 
@@ -85,6 +84,12 @@ const (
 	Greatest = "greatest"
 	Least    = "least"
 	Interval = "interval"
+
+	// masking functions
+	MaskFull    = "mask_full"
+	MaskPartial = "mask_partial"
+	MaskNull    = "mask_null"
+	MaskDate    = "mask_date"
 
 	// math functions
 	Abs      = "abs"
@@ -290,11 +295,14 @@ const (
 	IsIPv6          = "is_ipv6"
 	IsUsedLock      = "is_used_lock"
 	IsUUID          = "is_uuid"
-	MasterPosWait   = "master_pos_wait"
 	NameConst       = "name_const"
 	ReleaseAllLocks = "release_all_locks"
 	Sleep           = "sleep"
 	UUID            = "uuid"
+	UUIDv4          = "uuid_v4"
+	UUIDv7          = "uuid_v7"
+	UUIDVersion     = "uuid_version"
+	UUIDTimestamp   = "uuid_timestamp"
 	UUIDShort       = "uuid_short"
 	UUIDToBin       = "uuid_to_bin"
 	BinToUUID       = "bin_to_uuid"
@@ -310,13 +318,9 @@ const (
 	AesEncrypt               = "aes_encrypt"
 	Compress                 = "compress"
 	Decode                   = "decode"
-	DesDecrypt               = "des_decrypt"
-	DesEncrypt               = "des_encrypt"
 	Encode                   = "encode"
-	Encrypt                  = "encrypt"
 	MD5                      = "md5"
-	OldPassword              = "old_password"
-	PasswordFunc             = "password_func"
+	PasswordFunc             = "password"
 	RandomBytes              = "random_bytes"
 	SHA1                     = "sha1"
 	SHA                      = "sha"
@@ -334,6 +338,7 @@ const (
 	JSONObject        = "json_object"
 	JSONMerge         = "json_merge"
 	JSONSet           = "json_set"
+	JSONSumCrc32      = "json_sum_crc32"
 	JSONInsert        = "json_insert"
 	JSONReplace       = "json_replace"
 	JSONRemove        = "json_remove"
@@ -348,6 +353,7 @@ const (
 	JSONMergePreserve = "json_merge_preserve"
 	JSONPretty        = "json_pretty"
 	JSONQuote         = "json_quote"
+	JSONSchemaValid   = "json_schema_valid"
 	JSONSearch        = "json_search"
 	JSONStorageFree   = "json_storage_free"
 	JSONStorageSize   = "json_storage_size"
@@ -355,12 +361,157 @@ const (
 	JSONKeys          = "json_keys"
 	JSONLength        = "json_length"
 
+	// vector functions (tidb extension)
+	VecDims                 = "vec_dims"
+	VecL1Distance           = "vec_l1_distance"
+	VecL2Distance           = "vec_l2_distance"
+	VecNegativeInnerProduct = "vec_negative_inner_product"
+	VecCosineDistance       = "vec_cosine_distance"
+	VecL2Norm               = "vec_l2_norm"
+	VecFromText             = "vec_from_text"
+	VecAsText               = "vec_as_text"
+
+	// embedding functions (TiDB extension)
+	EmbedText = "embed_text"
+
+	// FTS functions (tidb extension)
+	FTSMatchWord         = "fts_match_word"
+	FTSMysqlMatchAgainst = "match_against"
+
+	// geospatial functions, as MySQL names them: constructors
+	GeomPoint              = "point"
+	GeomLineString         = "linestring"
+	GeomPolygon            = "polygon"
+	GeomMultiPoint         = "multipoint"
+	GeomMultiLineString    = "multilinestring"
+	GeomMultiPolygon       = "multipolygon"
+	GeomGeometryCollection = "geometrycollection"
+	GeomGeomCollection     = "geomcollection"
+	// geospatial readers and writers
+	StGeomFromText               = "st_geomfromtext"
+	StGeometryFromText           = "st_geometryfromtext"
+	StPointFromText              = "st_pointfromtext"
+	StLineFromText               = "st_linefromtext"
+	StLineStringFromText         = "st_linestringfromtext"
+	StPolyFromText               = "st_polyfromtext"
+	StPolygonFromText            = "st_polygonfromtext"
+	StMPointFromText             = "st_mpointfromtext"
+	StMultiPointFromText         = "st_multipointfromtext"
+	StMLineFromText              = "st_mlinefromtext"
+	StMultiLineStringFromText    = "st_multilinestringfromtext"
+	StMPolyFromText              = "st_mpolyfromtext"
+	StMultiPolygonFromText       = "st_multipolygonfromtext"
+	StGeomCollFromText           = "st_geomcollfromtext"
+	StGeomCollFromTxt            = "st_geomcollfromtxt"
+	StGeometryCollectionFromText = "st_geometrycollectionfromtext"
+	StGeomFromWKB                = "st_geomfromwkb"
+	StGeometryFromWKB            = "st_geometryfromwkb"
+	StPointFromWKB               = "st_pointfromwkb"
+	StLineFromWKB                = "st_linefromwkb"
+	StLineStringFromWKB          = "st_linestringfromwkb"
+	StPolyFromWKB                = "st_polyfromwkb"
+	StPolygonFromWKB             = "st_polygonfromwkb"
+	StMPointFromWKB              = "st_mpointfromwkb"
+	StMultiPointFromWKB          = "st_multipointfromwkb"
+	StMLineFromWKB               = "st_mlinefromwkb"
+	StMultiLineStringFromWKB     = "st_multilinestringfromwkb"
+	StMPolyFromWKB               = "st_mpolyfromwkb"
+	StMultiPolygonFromWKB        = "st_multipolygonfromwkb"
+	StGeomCollFromWKB            = "st_geomcollfromwkb"
+	StGeometryCollectionFromWKB  = "st_geometrycollectionfromwkb"
+	StGeomFromGeoJSON            = "st_geomfromgeojson"
+	StAsText                     = "st_astext"
+	StAsWKT                      = "st_aswkt"
+	StAsBinary                   = "st_asbinary"
+	StAsWKB                      = "st_aswkb"
+	StAsGeoJSON                  = "st_asgeojson"
+	// geospatial accessors
+	StSRID             = "st_srid"
+	StX                = "st_x"
+	StY                = "st_y"
+	StLatitude         = "st_latitude"
+	StLongitude        = "st_longitude"
+	StGeometryType     = "st_geometrytype"
+	StDimension        = "st_dimension"
+	StEnvelope         = "st_envelope"
+	StIsEmpty          = "st_isempty"
+	StIsValid          = "st_isvalid"
+	StIsSimple         = "st_issimple"
+	StIsClosed         = "st_isclosed"
+	StStartPoint       = "st_startpoint"
+	StEndPoint         = "st_endpoint"
+	StPointN           = "st_pointn"
+	StNumPoints        = "st_numpoints"
+	StExteriorRing     = "st_exteriorring"
+	StInteriorRingN    = "st_interiorringn"
+	StNumInteriorRings = "st_numinteriorrings"
+	StNumInteriorRing  = "st_numinteriorring"
+	StGeometryN        = "st_geometryn"
+	StNumGeometries    = "st_numgeometries"
+	StCentroid         = "st_centroid"
+	// geospatial measurement
+	StArea              = "st_area"
+	StLength            = "st_length"
+	StDistance          = "st_distance"
+	StDistanceSphere    = "st_distance_sphere"
+	StFrechetDistance   = "st_frechetdistance"
+	StHausdorffDistance = "st_hausdorffdistance"
+	// geospatial predicates
+	StContains    = "st_contains"
+	StCrosses     = "st_crosses"
+	StDisjoint    = "st_disjoint"
+	StEquals      = "st_equals"
+	StIntersects  = "st_intersects"
+	StOverlaps    = "st_overlaps"
+	StTouches     = "st_touches"
+	StWithin      = "st_within"
+	MBRContains   = "mbrcontains"
+	MBRCoveredBy  = "mbrcoveredby"
+	MBRCovers     = "mbrcovers"
+	MBRDisjoint   = "mbrdisjoint"
+	MBREquals     = "mbrequals"
+	MBRIntersects = "mbrintersects"
+	MBROverlaps   = "mbroverlaps"
+	MBRTouches    = "mbrtouches"
+	MBRWithin     = "mbrwithin"
+	// geospatial processing
+	StBuffer                = "st_buffer"
+	StBufferStrategy        = "st_buffer_strategy"
+	StCollect               = "st_collect"
+	StConvexHull            = "st_convexhull"
+	StDifference            = "st_difference"
+	StIntersection          = "st_intersection"
+	StLineInterpolatePoint  = "st_lineinterpolatepoint"
+	StLineInterpolatePoints = "st_lineinterpolatepoints"
+	StMakeEnvelope          = "st_makeenvelope"
+	StPointAtDistance       = "st_pointatdistance"
+	StSimplify              = "st_simplify"
+	StSwapXY                = "st_swapxy"
+	StSymDifference         = "st_symdifference"
+	StTransform             = "st_transform"
+	StUnion                 = "st_union"
+	StValidate              = "st_validate"
+	// geospatial geohash
+	StGeoHash          = "st_geohash"
+	StLatFromGeoHash   = "st_latfromgeohash"
+	StLongFromGeoHash  = "st_longfromgeohash"
+	StPointFromGeoHash = "st_pointfromgeohash"
+
+	// geospatial functions (TiDB extension): EWKB in and out
+	StAsEWKB       = "st_asewkb"
+	StGeomFromEWKB = "st_geomfromewkb"
+
+	// geospatial index functions (TiDB internal), behind the hidden columns of a geospatial index
+	TiDBSpatialKey  = "tidb_spatial_key"
+	TiDBSpatialKeys = "tidb_spatial_keys"
+	TiDBSpatialBBox = "tidb_spatial_bbox"
+
 	// TiDB internal function.
 	TiDBDecodeKey       = "tidb_decode_key"
+	TiDBMVCCInfo        = "tidb_mvcc_info"
+	TiDBEncodeRecordKey = "tidb_encode_record_key"
+	TiDBEncodeIndexKey  = "tidb_encode_index_key"
 	TiDBDecodeBase64Key = "tidb_decode_base64_key"
-
-	// MVCC information fetching function.
-	GetMvccInfo = "get_mvcc_info"
 
 	// Sequence function.
 	NextVal = "nextval"
@@ -379,9 +530,9 @@ const (
 type FuncCallExpr struct {
 	funcNode
 	Tp     FuncCallExprType
-	Schema model.CIStr
+	Schema CIStr
 	// FnName is the function name.
-	FnName model.CIStr
+	FnName CIStr
 	// Args is the function args.
 	Args []ExprNode
 }
@@ -509,16 +660,19 @@ func (n *FuncCallExpr) customRestore(ctx *format.RestoreCtx) (bool, error) {
 		return true, nil
 	}
 	if n.FnName.L == JSONMemberOf {
-		if err := n.Args[0].Restore(ctx); err != nil {
-			return true, errors.Annotatef(err, "An error occurred while restore FuncCallExpr.(MEMBER OF).Args[0]")
+		if len(n.Args) == 2 {
+			if err := restoreExprWithBinaryOpParent(ctx, n.Args[0], restoreOpMemberOf, binaryOpLeftSide); err != nil {
+				return true, errors.Annotatef(err, "An error occurred while restore FuncCallExpr.(MEMBER OF).Args[0]")
+			}
+			ctx.WriteKeyWord(" MEMBER OF ")
+			ctx.WritePlain("(")
+			if err := restoreExprWithBinaryOpParent(ctx, n.Args[1], restoreOpMemberOf, binaryOpRightSide); err != nil {
+				return true, errors.Annotatef(err, "An error occurred while restore FuncCallExpr.(MEMBER OF).Args[1]")
+			}
+			ctx.WritePlain(")")
+			return true, nil
 		}
-		ctx.WriteKeyWord(" MEMBER OF ")
-		ctx.WritePlain("(")
-		if err := n.Args[1].Restore(ctx); err != nil {
-			return true, errors.Annotatef(err, "An error occurred while restore FuncCallExpr.(MEMBER OF).Args[1]")
-		}
-		ctx.WritePlain(")")
-		return true, nil
+		return true, errors.WithStack(errors.Errorf("Incorrect parameter count in the call to native function 'json_memberof'"))
 	}
 	return false, nil
 }
@@ -594,6 +748,55 @@ const (
 	CastBinaryOperator
 )
 
+// JSONSumCrc32Expr is the function to calculate sum of crc32 values for array in json
+// It's modified from CastFunction to support processing JSON Array.
+type JSONSumCrc32Expr struct {
+	funcNode
+	// Expr is the expression to be converted.
+	Expr ExprNode
+	// Tp is the conversion type.
+	Tp *types.FieldType
+	// ExplicitCharSet is true when charset is explicit indicated.
+	ExplicitCharSet bool
+}
+
+// Restore implements Node interface.
+func (n *JSONSumCrc32Expr) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("JSON_SUM_CRC32")
+	ctx.WritePlain("(")
+	if err := n.Expr.Restore(ctx); err != nil {
+		return errors.Annotatef(err, "An error occurred while restore JSONSumCrc32Expr.Expr")
+	}
+	ctx.WriteKeyWord(" AS ")
+	n.Tp.RestoreAsCastType(ctx, n.ExplicitCharSet)
+	ctx.WritePlain(")")
+	return nil
+}
+
+// Format the ExprNode into a Writer.
+func (n *JSONSumCrc32Expr) Format(w io.Writer) {
+	fmt.Fprint(w, "JSON_SUM_CRC32(")
+	n.Expr.Format(w)
+	fmt.Fprint(w, " AS ")
+	n.Tp.FormatAsCastType(w, n.ExplicitCharSet)
+	fmt.Fprint(w, ")")
+}
+
+// Accept implements Node Accept interface.
+func (n *JSONSumCrc32Expr) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*JSONSumCrc32Expr)
+	node, ok := n.Expr.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Expr = node.(ExprNode)
+	return v.Leave(n)
+}
+
 // FuncCastExpr is the cast function converting value to another type, e.g, cast(expr AS signed).
 // See https://dev.mysql.com/doc/refman/5.7/en/cast-functions.html
 type FuncCastExpr struct {
@@ -631,7 +834,7 @@ func (n *FuncCastExpr) Restore(ctx *format.RestoreCtx) error {
 		ctx.WritePlain(")")
 	case CastBinaryOperator:
 		ctx.WriteKeyWord("BINARY ")
-		if err := n.Expr.Restore(ctx); err != nil {
+		if err := restoreExprWithUnaryOpParent(ctx, n.Expr); err != nil {
 			return errors.Annotatef(err, "An error occurred while restore FuncCastExpr.Expr")
 		}
 	}
@@ -748,6 +951,8 @@ const (
 	AggFuncCount = "count"
 	// AggFuncSum is the name of Sum function.
 	AggFuncSum = "sum"
+	// AggFuncSumInt is the name of SumInt function.
+	AggFuncSumInt = "sum_int"
 	// AggFuncAvg is the name of Avg function.
 	AggFuncAvg = "avg"
 	// AggFuncFirstRow is the name of FirstRowColumn function.
@@ -756,6 +961,10 @@ const (
 	AggFuncMax = "max"
 	// AggFuncMin is the name of min function.
 	AggFuncMin = "min"
+	// AggFuncMaxCount is the name of max_count function.
+	AggFuncMaxCount = "max_count"
+	// AggFuncMinCount is the name of min_count function.
+	AggFuncMinCount = "min_count"
 	// AggFuncGroupConcat is the name of group_concat function.
 	AggFuncGroupConcat = "group_concat"
 	// AggFuncBitOr is the name of bit_or function.
@@ -806,7 +1015,7 @@ func (n *AggregateFuncExpr) Restore(ctx *format.RestoreCtx) error {
 	}
 	switch strings.ToLower(n.F) {
 	case "group_concat":
-		for i := 0; i < len(n.Args)-1; i++ {
+		for i := range len(n.Args) - 1 {
 			if i != 0 {
 				ctx.WritePlain(", ")
 			}
@@ -821,7 +1030,11 @@ func (n *AggregateFuncExpr) Restore(ctx *format.RestoreCtx) error {
 			}
 		}
 		ctx.WriteKeyWord(" SEPARATOR ")
-		if err := n.Args[len(n.Args)-1].Restore(ctx); err != nil {
+		// The parser grammar only accepts `SEPARATOR stringLit` without charset introducer.
+		// Keep the literal text restorable even when separator carries charset/collation metadata.
+		separatorCtx := *ctx
+		separatorCtx.Flags |= format.RestoreStringWithoutCharset
+		if err := n.Args[len(n.Args)-1].Restore(&separatorCtx); err != nil {
 			return errors.Annotate(err, "An error occurred while restore AggregateFuncExpr.Args SEPARATOR")
 		}
 	default:

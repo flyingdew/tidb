@@ -22,11 +22,12 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/hack"
 	"github.com/stretchr/testify/require"
 )
 
-var testLongStr1 string = getLongString("平p凯k星x辰c")
-var testLongStr2 string = getLongString("123aa啊啊aa")
+var testLongStr1 string = getLongString("平352p凯额6辰c")
+var testLongStr2 string = getLongString("123a啊f24f去rsgvsfg")
 
 func getChunk() *chunk.Chunk {
 	fieldTypes := make([]*types.FieldType, 1)
@@ -36,7 +37,7 @@ func getChunk() *chunk.Chunk {
 
 func getLongString(originStr string) string {
 	returnStr := originStr
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		returnStr += returnStr
 	}
 	return returnStr
@@ -46,7 +47,7 @@ func getLargeRandBuffer() []byte {
 	byteLen := 10000
 	ret := make([]byte, byteLen)
 	randStart := rand.Int31()
-	for i := 0; i < byteLen; i++ {
+	for i := range byteLen {
 		ret[i] = byte((int(randStart) + i) % 8)
 	}
 	return ret
@@ -105,7 +106,7 @@ func TestPartialResult4Count(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4Count)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -150,7 +151,7 @@ func TestPartialResult4MaxMinInt(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinInt)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -195,7 +196,7 @@ func TestPartialResult4MaxMinUint(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinUint)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -240,7 +241,7 @@ func TestPartialResult4MaxMinDecimal(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinDecimal)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -285,7 +286,7 @@ func TestPartialResult4MaxMinFloat32(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinFloat32)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -330,7 +331,7 @@ func TestPartialResult4MaxMinFloat64(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinFloat64)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -375,7 +376,7 @@ func TestPartialResult4MaxMinTime(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinTime)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -421,7 +422,7 @@ func TestPartialResult4MaxMinString(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinString)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -467,8 +468,57 @@ func TestPartialResult4MaxMinJSON(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinJSON)(serializedPartialResults[i]), deserializedPartialResults[i])
+	}
+}
+
+func TestPartialResult4MaxMinVectorFloat32(t *testing.T) {
+	serializeHelper := NewSerializeHelper()
+
+	largeVecData := make([]float32, 1024)
+	for i := range largeVecData {
+		largeVecData[i] = float32(i)
+	}
+
+	// Initialize test data
+	expectData := []partialResult4MaxMinVectorFloat32{
+		{val: types.MustCreateVectorFloat32([]float32{1, 2, 3}), isNull: false},
+		{val: types.MustCreateVectorFloat32(largeVecData), isNull: true},
+	}
+	serializedPartialResults := make([]PartialResult, len(expectData))
+	testDataNum := len(serializedPartialResults)
+	for i := range serializedPartialResults {
+		pr := new(partialResult4MaxMinVectorFloat32)
+		*pr = expectData[i]
+		serializedPartialResults[i] = PartialResult(pr)
+	}
+
+	// Serialize test data
+	chk := getChunk()
+	for _, pr := range serializedPartialResults {
+		serializedData := serializeHelper.serializePartialResult4MaxMinVectorFloat32(*(*partialResult4MaxMinVectorFloat32)(pr))
+		chk.AppendBytes(0, serializedData)
+	}
+
+	// Deserialize test data
+	deserializeHelper := newDeserializeHelper(chk.Column(0), testDataNum)
+	deserializedPartialResults := make([]partialResult4MaxMinVectorFloat32, testDataNum+1)
+	index := 0
+	for {
+		success := deserializeHelper.deserializePartialResult4MaxMinVectorFloat32(&deserializedPartialResults[index])
+		if !success {
+			break
+		}
+		index++
+	}
+
+	chk.Column(0).DestroyDataForTest()
+
+	// Check some results
+	require.Equal(t, testDataNum, index)
+	for i := 0; i < testDataNum; i++ {
+		require.Equal(t, *(*partialResult4MaxMinVectorFloat32)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
 
@@ -513,7 +563,7 @@ func TestPartialResult4MaxMinEnum(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinEnum)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -559,7 +609,7 @@ func TestPartialResult4MaxMinSet(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4MaxMinSet)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -604,7 +654,7 @@ func TestPartialResult4AvgDecimal(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4AvgDecimal)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -649,7 +699,7 @@ func TestPartialResult4AvgFloat64(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4AvgFloat64)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -694,7 +744,7 @@ func TestPartialResult4SumDecimal(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4SumDecimal)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -739,20 +789,325 @@ func TestPartialResult4SumFloat64(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4SumFloat64)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
 
+func TestPartialResult4DistinctAgg(t *testing.T) {
+	t.Run("count int", func(t *testing.T) {
+		aggFunc := &baseCountDistinct4Int{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4CountDistinctInt)(pr).valSet.Insert(1)
+		(*partialResult4CountDistinctInt)(pr).valSet.Insert(-2)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4CountDistinctInt)(pr).valSet.M, (*partialResult4CountDistinctInt)(restored).valSet.M)
+	})
+
+	t.Run("count real", func(t *testing.T) {
+		aggFunc := &baseCountDistinct4Real{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4CountDistinctReal)(pr).valSet.Insert(1.25)
+		(*partialResult4CountDistinctReal)(pr).valSet.Insert(-2.5)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4CountDistinctReal)(pr).valSet.M, (*partialResult4CountDistinctReal)(restored).valSet.M)
+	})
+
+	t.Run("count decimal", func(t *testing.T) {
+		aggFunc := &baseCountDistinct4Decimal{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4CountDistinctDecimal)(pr).valSet.Insert("decimal-key")
+		(*partialResult4CountDistinctDecimal)(pr).valSet.Insert(string([]byte{0, 1, 2, 'x'}))
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4CountDistinctDecimal)(pr).valSet.M, (*partialResult4CountDistinctDecimal)(restored).valSet.M)
+	})
+
+	t.Run("count duration", func(t *testing.T) {
+		aggFunc := &baseCountDistinct4Duration{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4CountDistinctDuration)(pr).valSet.Insert(123)
+		(*partialResult4CountDistinctDuration)(pr).valSet.Insert(-456)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4CountDistinctDuration)(pr).valSet.M, (*partialResult4CountDistinctDuration)(restored).valSet.M)
+	})
+
+	t.Run("count string", func(t *testing.T) {
+		aggFunc := &baseCountDistinct4String{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4CountDistinctString)(pr).valSet.Insert("")
+		(*partialResult4CountDistinctString)(pr).valSet.Insert(testLongStr1)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4CountDistinctString)(pr).valSet.M, (*partialResult4CountDistinctString)(restored).valSet.M)
+	})
+
+	t.Run("count multi args", func(t *testing.T) {
+		aggFunc := &baseCountDistinct4MultiArgs{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4CountWithDistinct)(pr).valSet.Insert("arg1\x00arg2")
+		(*partialResult4CountWithDistinct)(pr).valSet.Insert(testLongStr2)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4CountWithDistinct)(pr).valSet.M, (*partialResult4CountWithDistinct)(restored).valSet.M)
+	})
+
+	t.Run("approx count distinct", func(t *testing.T) {
+		aggFunc := &approxCountDistinctOriginal{}
+		pr := newAggPartialResult(t, aggFunc)
+		approxPr := (*partialResult4ApproxCountDistinct)(pr)
+		for _, val := range []uint64{0, 1, 2, 1, 1024, 1<<32 - 1} {
+			approxPr.InsertHash64(val)
+		}
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		restoredApproxPr := (*partialResult4ApproxCountDistinct)(restored)
+		require.Equal(t, approxPr.Serialize(), restoredApproxPr.Serialize())
+		require.Equal(t, approxPr.fixedSize(), restoredApproxPr.fixedSize())
+	})
+
+	t.Run("avg decimal", func(t *testing.T) {
+		aggFunc := &baseAvgDistinct4Decimal{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4AvgDistinctDecimal)(pr).valSet.Insert("d1", types.NewDecFromInt(10))
+		(*partialResult4AvgDistinctDecimal)(pr).valSet.Insert("d2", types.NewDecFromInt(-20))
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4AvgDistinctDecimal)(pr).valSet.M, (*partialResult4AvgDistinctDecimal)(restored).valSet.M)
+	})
+
+	t.Run("avg float64", func(t *testing.T) {
+		aggFunc := &baseAvgDistinct4Float64{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4AvgDistinctFloat64)(pr).valSet.Insert(10.5)
+		(*partialResult4AvgDistinctFloat64)(pr).valSet.Insert(-20.75)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4AvgDistinctFloat64)(pr).valSet.M, (*partialResult4AvgDistinctFloat64)(restored).valSet.M)
+	})
+
+	t.Run("sum decimal", func(t *testing.T) {
+		aggFunc := &baseSumDistinct4Decimal{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4SumDistinctDecimal)(pr).valSet.Insert("s1", types.NewDecFromInt(100))
+		(*partialResult4SumDistinctDecimal)(pr).valSet.Insert("s2", types.NewDecFromInt(-200))
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4SumDistinctDecimal)(pr).valSet.M, (*partialResult4SumDistinctDecimal)(restored).valSet.M)
+	})
+
+	t.Run("sum float64", func(t *testing.T) {
+		aggFunc := &baseSumDistinct4Float64{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4SumDistinctFloat64)(pr).valSet.Insert(100.5)
+		(*partialResult4SumDistinctFloat64)(pr).valSet.Insert(-200.75)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4SumDistinctFloat64)(pr).valSet.M, (*partialResult4SumDistinctFloat64)(restored).valSet.M)
+	})
+
+	t.Run("sum int64", func(t *testing.T) {
+		aggFunc := &sumDistinctInt64{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4SumDistinctInt64)(pr).valSet.Insert(100)
+		(*partialResult4SumDistinctInt64)(pr).valSet.Insert(-200)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4SumDistinctInt64)(pr).valSet.M, (*partialResult4SumDistinctInt64)(restored).valSet.M)
+	})
+
+	t.Run("sum uint64", func(t *testing.T) {
+		aggFunc := &sumDistinctUint64{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4SumDistinctUint64)(pr).valSet.Insert(100)
+		// Unsigned values are stored as int64 bit-pattern keys.
+		(*partialResult4SumDistinctUint64)(pr).valSet.Insert(-1)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4SumDistinctUint64)(pr).valSet.M, (*partialResult4SumDistinctUint64)(restored).valSet.M)
+	})
+
+	t.Run("variance float64", func(t *testing.T) {
+		aggFunc := &varPopOriginal4DistinctFloat64{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4VarPopDistinctFloat64)(pr).valSet.Insert(1.5)
+		(*partialResult4VarPopDistinctFloat64)(pr).valSet.Insert(3.5)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4VarPopDistinctFloat64)(pr).valSet.M, (*partialResult4VarPopDistinctFloat64)(restored).valSet.M)
+	})
+
+	t.Run("group concat", func(t *testing.T) {
+		aggFunc := &baseGroupConcatDistinct4String{}
+		pr := newAggPartialResult(t, aggFunc)
+		(*partialResult4GroupConcatDistinct)(pr).valSet.Insert("k1", "v1")
+		(*partialResult4GroupConcatDistinct)(pr).valSet.Insert(testLongStr1, testLongStr2)
+
+		restored := roundTripAggPartialResult(t, aggFunc, pr)
+		require.Equal(t, (*partialResult4GroupConcatDistinct)(pr).valSet.M, (*partialResult4GroupConcatDistinct)(restored).valSet.M)
+		require.NotNil(t, (*partialResult4GroupConcatDistinct)(restored).valsBuf)
+	})
+
+	t.Run("non-distinct variance", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			aggFunc AggFunc
+		}{
+			{name: "var pop", aggFunc: &varPop4Float64{}},
+			{name: "var samp", aggFunc: &varSamp4Float64{}},
+			{name: "stddev pop", aggFunc: &stdDevPop4Float64{}},
+			{name: "stddev samp", aggFunc: &stddevSamp4Float64{}},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				pr := newAggPartialResult(t, test.aggFunc)
+				*(*partialResult4VarPopFloat64)(pr) = partialResult4VarPopFloat64{
+					count:    3,
+					sum:      7.5,
+					variance: 4.25,
+				}
+
+				restored := roundTripAggPartialResult(t, test.aggFunc, pr)
+				require.Equal(t, *(*partialResult4VarPopFloat64)(pr), *(*partialResult4VarPopFloat64)(restored))
+			})
+		}
+	})
+
+	t.Run("approx percentile", func(t *testing.T) {
+		t.Run("no state", func(t *testing.T) {
+			aggFunc := &basePercentile{}
+			chk := getChunk()
+			aggFunc.SerializePartialResult(nil, chk, NewSerializeHelper())
+
+			restored, memDelta := aggFunc.DeserializePartialResult(chk)
+			require.Len(t, restored, 1)
+			require.Nil(t, restored[0])
+			require.Zero(t, memDelta)
+			require.NotPanics(t, func() {
+				_, err := aggFunc.MergePartialResult(nil, restored[0], nil)
+				require.NoError(t, err)
+			})
+		})
+
+		t.Run("int", func(t *testing.T) {
+			aggFunc := &percentileOriginal4Int{}
+			pr := newAggPartialResult(t, aggFunc)
+			*(*partialResult4PercentileInt)(pr) = partialResult4PercentileInt{-3, 0, 10}
+
+			restored := roundTripAggPartialResult(t, aggFunc, pr)
+			require.Equal(t, *(*partialResult4PercentileInt)(pr), *(*partialResult4PercentileInt)(restored))
+		})
+
+		t.Run("real", func(t *testing.T) {
+			aggFunc := &percentileOriginal4Real{}
+			pr := newAggPartialResult(t, aggFunc)
+			*(*partialResult4PercentileReal)(pr) = partialResult4PercentileReal{-1.5, 2.25}
+
+			restored := roundTripAggPartialResult(t, aggFunc, pr)
+			require.Equal(t, *(*partialResult4PercentileReal)(pr), *(*partialResult4PercentileReal)(restored))
+		})
+
+		t.Run("decimal", func(t *testing.T) {
+			aggFunc := &percentileOriginal4Decimal{}
+			pr := newAggPartialResult(t, aggFunc)
+			*(*partialResult4PercentileDecimal)(pr) = partialResult4PercentileDecimal{
+				*types.NewDecFromInt(-2),
+				*types.NewDecFromInt(11),
+			}
+
+			restored := roundTripAggPartialResult(t, aggFunc, pr)
+			require.Equal(t, *(*partialResult4PercentileDecimal)(pr), *(*partialResult4PercentileDecimal)(restored))
+		})
+
+		t.Run("time", func(t *testing.T) {
+			aggFunc := &percentileOriginal4Time{}
+			pr := newAggPartialResult(t, aggFunc)
+			*(*partialResult4PercentileTime)(pr) = partialResult4PercentileTime{
+				types.TimeFromDays(1),
+				types.TimeFromDays(365),
+			}
+
+			restored := roundTripAggPartialResult(t, aggFunc, pr)
+			require.Equal(t, *(*partialResult4PercentileTime)(pr), *(*partialResult4PercentileTime)(restored))
+		})
+
+		t.Run("duration", func(t *testing.T) {
+			aggFunc := &percentileOriginal4Duration{}
+			pr := newAggPartialResult(t, aggFunc)
+			*(*partialResult4PercentileDuration)(pr) = partialResult4PercentileDuration{
+				{Duration: -123, Fsp: 2},
+				{Duration: 456, Fsp: 4},
+			}
+
+			restored := roundTripAggPartialResult(t, aggFunc, pr)
+			require.Equal(t, *(*partialResult4PercentileDuration)(pr), *(*partialResult4PercentileDuration)(restored))
+		})
+	})
+
+	t.Run("vector", func(t *testing.T) {
+		vector := types.MustCreateVectorFloat32([]float32{-1.5, 0, 2.25})
+
+		t.Run("first row", func(t *testing.T) {
+			aggFunc := &firstRow4VectorFloat32{}
+			pr := newAggPartialResult(t, aggFunc)
+			*(*partialResult4FirstRowVectorFloat32)(pr) = partialResult4FirstRowVectorFloat32{
+				basePartialResult4FirstRow: basePartialResult4FirstRow{gotFirstRow: true},
+				val:                        vector,
+			}
+
+			restored := roundTripAggPartialResult(t, aggFunc, pr)
+			restoredResult := (*partialResult4FirstRowVectorFloat32)(restored)
+			require.Equal(t, (*partialResult4FirstRowVectorFloat32)(pr).basePartialResult4FirstRow, restoredResult.basePartialResult4FirstRow)
+			require.Equal(t, vector.ZeroCopySerialize(), restoredResult.val.ZeroCopySerialize())
+		})
+
+		t.Run("max min", func(t *testing.T) {
+			aggFunc := &maxMin4VectorFloat32{}
+			pr := newAggPartialResult(t, aggFunc)
+			*(*partialResult4MaxMinVectorFloat32)(pr) = partialResult4MaxMinVectorFloat32{val: vector}
+
+			restored := roundTripAggPartialResult(t, aggFunc, pr)
+			restoredResult := (*partialResult4MaxMinVectorFloat32)(restored)
+			require.False(t, restoredResult.isNull)
+			require.Equal(t, vector.ZeroCopySerialize(), restoredResult.val.ZeroCopySerialize())
+		})
+	})
+}
+
+func newAggPartialResult(t *testing.T, aggFunc AggFunc) PartialResult {
+	pr, memDelta := aggFunc.AllocPartialResult()
+	require.NotNil(t, pr)
+	require.Positive(t, memDelta)
+	return pr
+}
+
+func roundTripAggPartialResult(t *testing.T, aggFunc AggFunc, pr PartialResult) PartialResult {
+	serializeHelper := NewSerializeHelper()
+	chunk := getChunk()
+	aggFunc.SerializePartialResult(pr, chunk, serializeHelper)
+
+	restored, memDelta := aggFunc.DeserializePartialResult(chunk)
+	chunk.Column(0).DestroyDataForTest()
+
+	require.Len(t, restored, 1)
+	require.Positive(t, memDelta)
+	return restored[0]
+}
+
 func TestBasePartialResult4GroupConcat(t *testing.T) {
 	var serializeHelper = NewSerializeHelper()
+	serializeHelper.buf = make([]byte, 0)
 	bufSizeChecker := newBufferSizeChecker()
 
 	// Initialize test data
 	expectData := []basePartialResult4GroupConcat{
+		{valsBuf: bytes.NewBufferString("123"), buffer: nil},
 		{valsBuf: bytes.NewBufferString(""), buffer: bytes.NewBufferString("")},
-		{valsBuf: bytes.NewBufferString("xzxx"), buffer: bytes.NewBufferString(testLongStr2)},
-		{valsBuf: bytes.NewBufferString(testLongStr1), buffer: bytes.NewBufferString(testLongStr2)},
+		{valsBuf: bytes.NewBufferString(""), buffer: bytes.NewBufferString(testLongStr1)},
+		{valsBuf: bytes.NewBufferString(""), buffer: bytes.NewBufferString(testLongStr2)},
 	}
 	serializedPartialResults := make([]PartialResult, len(expectData))
 	testDataNum := len(serializedPartialResults)
@@ -786,9 +1141,12 @@ func TestBasePartialResult4GroupConcat(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
-		require.Equal(t, (*basePartialResult4GroupConcat)(serializedPartialResults[i]).valsBuf.String(), deserializedPartialResults[i].valsBuf.String())
-		require.Equal(t, (*basePartialResult4GroupConcat)(serializedPartialResults[i]).buffer.String(), deserializedPartialResults[i].buffer.String())
+	for i := range testDataNum {
+		if (*basePartialResult4GroupConcat)(serializedPartialResults[i]).buffer != nil {
+			require.Equal(t, (*basePartialResult4GroupConcat)(serializedPartialResults[i]).buffer.String(), deserializedPartialResults[i].buffer.String())
+		} else {
+			require.Equal(t, (*bytes.Buffer)(nil), deserializedPartialResults[i].buffer)
+		}
 	}
 }
 
@@ -828,7 +1186,7 @@ func TestPartialResult4BitFunc(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4BitFunc)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -839,9 +1197,9 @@ func TestPartialResult4JsonArrayagg(t *testing.T) {
 
 	// Initialize test data
 	expectData := []partialResult4JsonArrayagg{
-		{entries: []interface{}{int64(1), float64(1.1), "", true, types.Opaque{TypeCode: 1, Buf: getLargeRandBuffer()}, types.NewTime(9876, 12, 10)}},
-		{entries: []interface{}{int64(1), float64(1.1), false, types.NewDuration(1, 2, 3, 4, 5), testLongStr1}},
-		{entries: []interface{}{"dw啊q", float64(-1.1), int64(0), types.NewDuration(1, 2, 3, 4, 5), types.NewTime(123, 1, 2), testLongStr1, types.BinaryJSON{TypeCode: 1, Value: []byte(testLongStr2)}, types.Opaque{TypeCode: 6, Buf: getLargeRandBuffer()}}},
+		{entries: []any{int64(1), float64(1.1), "", true, types.Opaque{TypeCode: 1, Buf: getLargeRandBuffer()}, types.NewTime(9876, 12, 10)}},
+		{entries: []any{int64(1), float64(1.1), false, types.NewDuration(1, 2, 3, 4, 5), testLongStr1}},
+		{entries: []any{"dw啊q", float64(-1.1), int64(0), types.NewDuration(1, 2, 3, 4, 5), types.NewTime(123, 1, 2), testLongStr1, types.BinaryJSON{TypeCode: 1, Value: []byte(testLongStr2)}, types.Opaque{TypeCode: 6, Buf: getLargeRandBuffer()}}},
 	}
 	serializedPartialResults := make([]PartialResult, len(expectData))
 	testDataNum := len(serializedPartialResults)
@@ -875,7 +1233,7 @@ func TestPartialResult4JsonArrayagg(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4JsonArrayagg)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -884,11 +1242,16 @@ func TestPartialResult4JsonObjectAgg(t *testing.T) {
 	serializeHelper := NewSerializeHelper()
 	bufSizeChecker := newBufferSizeChecker()
 
+	wrapMemAwareMap := func(m map[string]any) (res hack.MemAwareMap[string, any]) {
+		res.Init(m)
+		return res
+	}
+
 	// Initialize test data
 	expectData := []partialResult4JsonObjectAgg{
-		{entries: map[string]interface{}{"123": int64(1), "234": float64(1.1), "999": true, "235": "123"}, bInMap: 0},
-		{entries: map[string]interface{}{"啊": testLongStr1, "我": float64(1.1), "反": int64(456)}, bInMap: 0},
-		{entries: map[string]interface{}{"fe": testLongStr1, " ": int64(36798), "888": false, "": testLongStr2}, bInMap: 0},
+		{entries: wrapMemAwareMap(map[string]any{"123": int64(1), "234": float64(1.1), "999": true, "235": "123"})},
+		{entries: wrapMemAwareMap(map[string]any{"啊": testLongStr1, "我": float64(1.1), "反": int64(456)})},
+		{entries: wrapMemAwareMap(map[string]any{"fe": testLongStr1, " ": int64(36798), "888": false, "": testLongStr2})},
 	}
 	serializedPartialResults := make([]PartialResult, len(expectData))
 	testDataNum := len(serializedPartialResults)
@@ -922,7 +1285,7 @@ func TestPartialResult4JsonObjectAgg(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4JsonObjectAgg)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -967,7 +1330,7 @@ func TestPartialResult4FirstRowDecimal(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowDecimal)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -1012,7 +1375,7 @@ func TestPartialResult4FirstRowInt(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowInt)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -1057,7 +1420,7 @@ func TestPartialResult4FirstRowTime(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowTime)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -1103,7 +1466,7 @@ func TestPartialResult4FirstRowString(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowString)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -1148,7 +1511,7 @@ func TestPartialResult4FirstRowFloat32(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowFloat32)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -1193,7 +1556,7 @@ func TestPartialResult4FirstRowFloat64(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowFloat64)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -1238,7 +1601,7 @@ func TestPartialResult4FirstRowDuration(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowDuration)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -1284,7 +1647,7 @@ func TestPartialResult4FirstRowJSON(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowJSON)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -1330,7 +1693,7 @@ func TestPartialResult4FirstRowEnum(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowEnum)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }
@@ -1376,7 +1739,7 @@ func TestPartialResult4FirstRowSet(t *testing.T) {
 
 	// Check some results
 	require.Equal(t, testDataNum, index)
-	for i := 0; i < testDataNum; i++ {
+	for i := range testDataNum {
 		require.Equal(t, *(*partialResult4FirstRowSet)(serializedPartialResults[i]), deserializedPartialResults[i])
 	}
 }

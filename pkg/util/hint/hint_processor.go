@@ -18,20 +18,15 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/pingcap/errors"
-	"github.com/pingcap/tidb/pkg/errno"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/format"
-	"github.com/pingcap/tidb/pkg/parser/model"
-	"github.com/pingcap/tidb/pkg/sessionctx"
-	"github.com/pingcap/tidb/pkg/util/dbterror"
+	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"go.uber.org/zap"
 )
 
 var supportedHintNameForInsertStmt = map[string]struct{}{}
-var errWarnConflictingHint = dbterror.ClassUtil.NewStd(errno.ErrWarnConflictingHint)
 
 func init() {
 	supportedHintNameForInsertStmt["memory_quota"] = struct{}{}
@@ -43,12 +38,20 @@ type HintsSet struct {
 	indexHints [][]*ast.IndexHint          // Slice offset is the traversal order of `TableName` in the ast.
 }
 
-// GetFirstTableHints gets the first table hints.
-func (hs *HintsSet) GetFirstTableHints() []*ast.TableOptimizerHint {
+// GetStmtHints gets all statement-level hints.
+func (hs *HintsSet) GetStmtHints() []*ast.TableOptimizerHint {
+	var result []*ast.TableOptimizerHint
 	if len(hs.tableHints) > 0 {
-		return hs.tableHints[0]
+		result = append(result, hs.tableHints[0]...) // keep the same behavior with prior implementation
 	}
-	return nil
+	for _, tHints := range hs.tableHints[1:] {
+		for _, h := range tHints {
+			if isStmtHint(h) {
+				result = append(result, h)
+			}
+		}
+	}
+	return result
 }
 
 // ContainTableHint checks whether the table hint set contains a hint.
@@ -76,7 +79,7 @@ func setTableHints4StmtNode(node ast.Node, hints []*ast.TableOptimizerHint) {
 }
 
 // ExtractTableHintsFromStmtNode extracts table hints from this node.
-func ExtractTableHintsFromStmtNode(node ast.Node, sctx sessionctx.Context) []*ast.TableOptimizerHint {
+func ExtractTableHintsFromStmtNode(node ast.Node, warnHandler hintWarnHandler) []*ast.TableOptimizerHint {
 	switch x := node.(type) {
 	case *ast.SelectStmt:
 		return x.TableHints
@@ -86,16 +89,80 @@ func ExtractTableHintsFromStmtNode(node ast.Node, sctx sessionctx.Context) []*as
 		return x.TableHints
 	case *ast.InsertStmt:
 		// check duplicated hints
-		checkInsertStmtHintDuplicated(node, sctx)
-		return x.TableHints
+		checkInsertStmtHintDuplicated(node, warnHandler)
+		result := make([]*ast.TableOptimizerHint, 0, len(x.TableHints))
+		result = append(result, x.TableHints...)
+		if x.Select != nil {
+			// support statement-level hint in sub-select: "insert into t select /* ... */ ..."
+			// TODO: support this for Update and Delete as well
+			for _, h := range ExtractTableHintsFromStmtNode(x.Select, warnHandler) {
+				if isStmtHint(h) {
+					result = append(result, h)
+				}
+			}
+		}
+		return result
+	case *ast.SetOprStmt:
+		var result []*ast.TableOptimizerHint
+		if x.SelectList == nil {
+			return nil
+		}
+		for _, s := range x.SelectList.Selects {
+			tmp := ExtractTableHintsFromStmtNode(s, warnHandler)
+			if len(tmp) != 0 {
+				result = append(result, tmp...)
+			}
+		}
+		return result
 	default:
 		return nil
 	}
 }
 
+func containTableHint(hints []*ast.TableOptimizerHint, hintName string) bool {
+	for _, hint := range hints {
+		if hint.HintName.L == hintName {
+			return true
+		}
+	}
+	return false
+}
+
+// ContainTableHintInStmtNode checks whether the statement contains the target table hint.
+func ContainTableHintInStmtNode(node ast.Node, hintName string) bool {
+	switch x := node.(type) {
+	case *ast.SelectStmt:
+		return containTableHint(x.TableHints, hintName)
+	case *ast.UpdateStmt:
+		return containTableHint(x.TableHints, hintName)
+	case *ast.DeleteStmt:
+		return containTableHint(x.TableHints, hintName)
+	case *ast.InsertStmt:
+		if containTableHint(x.TableHints, hintName) {
+			return true
+		}
+		if x.Select == nil {
+			return false
+		}
+		return ContainTableHintInStmtNode(x.Select, hintName)
+	case *ast.SetOprStmt:
+		if x.SelectList == nil {
+			return false
+		}
+		for _, s := range x.SelectList.Selects {
+			if ContainTableHintInStmtNode(s, hintName) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
 // checkInsertStmtHintDuplicated check whether existed the duplicated hints in both insertStmt and its selectStmt.
 // If existed, it would send a warning message.
-func checkInsertStmtHintDuplicated(node ast.Node, sctx sessionctx.Context) {
+func checkInsertStmtHintDuplicated(node ast.Node, warnHandler hintWarnHandler) {
 	switch x := node.(type) {
 	case *ast.InsertStmt:
 		if len(x.TableHints) > 0 {
@@ -116,7 +183,7 @@ func checkInsertStmtHintDuplicated(node ast.Node, sctx sessionctx.Context) {
 				}
 				if duplicatedHint != nil {
 					hint := fmt.Sprintf("%s(`%v`)", duplicatedHint.HintName.O, duplicatedHint.HintData)
-					sctx.GetSessionVars().StmtCtx.AppendWarning(errWarnConflictingHint.FastGenByArgs(hint))
+					warnHandler.SetHintWarningFromError(plannererrors.ErrWarnConflictingHint.FastGenByArgs(hint))
 				}
 			}
 		}
@@ -193,7 +260,7 @@ type hintProcessor struct {
 	blockCounter int
 }
 
-func (hp *hintProcessor) Enter(in ast.Node) (ast.Node, bool) {
+func (hp *hintProcessor) Enter(in ast.Node) (skipChildren bool) {
 	switch v := in.(type) {
 	case *ast.SelectStmt, *ast.UpdateStmt, *ast.DeleteStmt:
 		if hp.bindHint2Ast {
@@ -210,7 +277,7 @@ func (hp *hintProcessor) Enter(in ast.Node) (ast.Node, bool) {
 	case *ast.TableName:
 		// Insert cases.
 		if hp.blockCounter == 0 {
-			return in, false
+			return false
 		}
 		if hp.bindHint2Ast {
 			if hp.indexCounter < len(hp.indexHints) {
@@ -223,28 +290,28 @@ func (hp *hintProcessor) Enter(in ast.Node) (ast.Node, bool) {
 			hp.indexHints = append(hp.indexHints, v.IndexHints)
 		}
 	}
-	return in, false
+	return false
 }
 
-func (hp *hintProcessor) Leave(in ast.Node) (ast.Node, bool) {
+func (hp *hintProcessor) Leave(in ast.Node) (proceed bool) {
 	switch in.(type) {
 	case *ast.SelectStmt, *ast.UpdateStmt, *ast.DeleteStmt:
 		hp.blockCounter--
 	}
-	return in, true
+	return true
 }
 
 // CollectHint collects hints for a statement.
 func CollectHint(in ast.StmtNode) *HintsSet {
 	hp := hintProcessor{HintsSet: &HintsSet{tableHints: make([][]*ast.TableOptimizerHint, 0, 4), indexHints: make([][]*ast.IndexHint, 0, 4)}}
-	in.Accept(&hp)
+	ast.Walk(in, &hp)
 	return hp.HintsSet
 }
 
 // BindHint will add hints for stmt according to the hints in `hintsSet`.
 func BindHint(stmt ast.StmtNode, hintsSet *HintsSet) ast.StmtNode {
 	hp := hintProcessor{HintsSet: hintsSet, bindHint2Ast: true}
-	stmt.Accept(&hp)
+	ast.Walk(stmt, &hp)
 	return stmt
 }
 
@@ -260,8 +327,8 @@ func ParseHintsSet(p *parser.Parser, sql, charset, collation, db string) (*Hints
 		return nil, nil, nil, fmt.Errorf("bind_sql must be a single statement: %s", sql)
 	}
 	hs := CollectHint(stmtNodes[0])
-	processor := &QBHintHandler{}
-	stmtNodes[0].Accept(processor)
+	processor := NewQBHintHandler(nil)
+	ast.Walk(stmtNodes[0], processor)
 	topNodeType := nodeType4Stmt(stmtNodes[0])
 	for i, tblHints := range hs.tableHints {
 		newHints := make([]*ast.TableOptimizerHint, 0, len(tblHints))
@@ -291,7 +358,7 @@ func ParseHintsSet(p *parser.Parser, sql, charset, collation, db string) (*Hints
 			}
 			for i, tbl := range tblHint.Tables {
 				if tbl.DBName.String() == "" {
-					tblHint.Tables[i].DBName = model.NewCIStr(db)
+					tblHint.Tables[i].DBName = processor.resolveHintDBName(processor.GetHintOffset(tbl.QBName, offset), tbl.TableName, db)
 				}
 			}
 			newHints = append(newHints, tblHint)
@@ -346,54 +413,54 @@ func nodeType4Stmt(node ast.StmtNode) NodeType {
 	return TypeInvalid
 }
 
-// CheckBindingFromHistoryBindable checks whether the ast and hint string from history is bindable.
-// Not support:
+// CheckBindingFromHistoryComplete checks whether the ast and hint string from history is complete.
+// For these complex queries, the auto-generated binding might be not complete:
 // 1. query use tiFlash engine
 // 2. query with sub query
 // 3. query with more than 2 table join
-func CheckBindingFromHistoryBindable(node ast.Node, hintStr string) error {
+func CheckBindingFromHistoryComplete(node ast.Node, hintStr string) (complete bool, reason string) {
 	// check tiflash
 	contain := strings.Contains(hintStr, "tiflash")
 	if contain {
-		return errors.New("can't create binding for query with tiflash engine")
+		return false, "auto-generated hint for queries accessing TiFlash might not be complete, the plan might change even after creating this binding"
 	}
 
 	checker := bindableChecker{
-		bindable: true,
-		tables:   make(map[model.CIStr]struct{}, 2),
+		complete: true,
+		tables:   make(map[ast.CIStr]struct{}, 2),
 	}
-	node.Accept(&checker)
-	return checker.reason
+	ast.Walk(node, &checker)
+	return checker.complete, checker.reason
 }
 
 // bindableChecker checks whether a binding from history can be created.
 type bindableChecker struct {
-	bindable bool
-	reason   error
-	tables   map[model.CIStr]struct{}
+	complete bool
+	reason   string
+	tables   map[ast.CIStr]struct{}
 }
 
-// Enter implements Visitor interface.
-func (checker *bindableChecker) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
+// Enter implements InPlaceVisitor interface.
+func (checker *bindableChecker) Enter(in ast.Node) (skipChildren bool) {
 	switch node := in.(type) {
 	case *ast.ExistsSubqueryExpr, *ast.SubqueryExpr:
-		checker.bindable = false
-		checker.reason = errors.New("can't create binding for query with sub query")
-		return in, true
+		checker.complete = false
+		checker.reason = "auto-generated hint for queries with sub queries might not be complete, the plan might change even after creating this binding"
+		return true
 	case *ast.TableName:
 		if _, ok := checker.tables[node.Schema]; !ok {
 			checker.tables[node.Name] = struct{}{}
 		}
 		if len(checker.tables) >= 3 {
-			checker.bindable = false
-			checker.reason = errors.New("can't create binding for query with more than two table join")
-			return in, true
+			checker.complete = false
+			checker.reason = "auto-generated hint for queries with more than 3 table join might not be complete, the plan might change even after creating this binding"
+			return true
 		}
 	}
-	return in, false
+	return false
 }
 
-// Leave implements Visitor interface.
-func (checker *bindableChecker) Leave(in ast.Node) (out ast.Node, ok bool) {
-	return in, checker.bindable
+// Leave implements InPlaceVisitor interface.
+func (checker *bindableChecker) Leave(ast.Node) bool {
+	return checker.complete
 }

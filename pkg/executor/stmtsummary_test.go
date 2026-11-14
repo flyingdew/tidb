@@ -16,24 +16,30 @@ package executor
 
 import (
 	"context"
+	"math"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/pingcap/tidb/pkg/infoschema"
-	"github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/meta/metadef"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/types"
-	"github.com/pingcap/tidb/pkg/util"
+	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
 	"github.com/pingcap/tidb/pkg/util/mock"
 	stmtsummaryv2 "github.com/pingcap/tidb/pkg/util/stmtsummary/v2"
 	"github.com/stretchr/testify/require"
 )
 
 func TestStmtSummaryRetriverV2_TableStatementsSummary(t *testing.T) {
-	infoSchemaBuilder, err := infoschema.NewBuilder(nil, nil).InitWithDBInfos(nil, nil, nil, 0)
+	data := infoschema.NewData()
+	schemaCacheSize := vardef.SchemaCacheSize.Load()
+	infoSchemaBuilder := infoschema.NewBuilder(nil, schemaCacheSize, nil, data, schemaCacheSize > 0)
+	err := infoSchemaBuilder.InitWithDBInfos(nil, nil, nil, nil, 0)
 	require.NoError(t, err)
-	infoSchema := infoSchemaBuilder.Build()
-	table, err := infoSchema.TableByName(util.InformationSchemaName, model.NewCIStr(infoschema.TableStatementsSummary))
+	infoSchema := infoSchemaBuilder.Build(math.MaxUint64)
+	table, err := infoSchema.TableByName(context.Background(), metadef.InformationSchemaName, ast.NewCIStr(infoschema.TableStatementsSummary))
 	require.NoError(t, err)
 	columns := table.Meta().Columns
 
@@ -57,7 +63,8 @@ func TestStmtSummaryRetriverV2_TableStatementsSummary(t *testing.T) {
 
 	ctx := context.Background()
 	sctx := mock.NewContext()
-	sctx.GetSessionVars().TimeZone, _ = time.LoadLocation("Asia/Shanghai")
+	tz, _ := time.LoadLocation("Asia/Shanghai")
+	sctx.ResetSessionAndStmtTimeZone(tz)
 
 	var results [][]types.Datum
 	for {
@@ -72,10 +79,13 @@ func TestStmtSummaryRetriverV2_TableStatementsSummary(t *testing.T) {
 }
 
 func TestStmtSummaryRetriverV2_TableStatementsSummaryEvicted(t *testing.T) {
-	infoSchemaBuilder, err := infoschema.NewBuilder(nil, nil).InitWithDBInfos(nil, nil, nil, 0)
+	data := infoschema.NewData()
+	schemaCacheSize := vardef.SchemaCacheSize.Load()
+	infoSchemaBuilder := infoschema.NewBuilder(nil, schemaCacheSize, nil, data, schemaCacheSize > 0)
+	err := infoSchemaBuilder.InitWithDBInfos(nil, nil, nil, nil, 0)
 	require.NoError(t, err)
-	infoSchema := infoSchemaBuilder.Build()
-	table, err := infoSchema.TableByName(util.InformationSchemaName, model.NewCIStr(infoschema.TableStatementsSummaryEvicted))
+	infoSchema := infoSchemaBuilder.Build(math.MaxUint64)
+	table, err := infoSchema.TableByName(context.Background(), metadef.InformationSchemaName, ast.NewCIStr(infoschema.TableStatementsSummaryEvicted))
 	require.NoError(t, err)
 	columns := table.Meta().Columns
 
@@ -99,7 +109,8 @@ func TestStmtSummaryRetriverV2_TableStatementsSummaryEvicted(t *testing.T) {
 
 	ctx := context.Background()
 	sctx := mock.NewContext()
-	sctx.GetSessionVars().TimeZone, _ = time.LoadLocation("Asia/Shanghai")
+	tz, _ := time.LoadLocation("Asia/Shanghai")
+	sctx.ResetSessionAndStmtTimeZone(tz)
 
 	var results [][]types.Datum
 	for {
@@ -149,10 +160,13 @@ func TestStmtSummaryRetriverV2_TableStatementsSummaryHistory(t *testing.T) {
 	stmtSummary.Add(stmtsummaryv2.GenerateStmtExecInfo4Test("digest3"))
 	stmtSummary.Add(stmtsummaryv2.GenerateStmtExecInfo4Test("digest3"))
 
-	infoSchemaBuilder, err := infoschema.NewBuilder(nil, nil).InitWithDBInfos(nil, nil, nil, 0)
+	data := infoschema.NewData()
+	schemaCacheSize := vardef.SchemaCacheSize.Load()
+	infoSchemaBuilder := infoschema.NewBuilder(nil, schemaCacheSize, nil, data, schemaCacheSize > 0)
+	err = infoSchemaBuilder.InitWithDBInfos(nil, nil, nil, nil, 0)
 	require.NoError(t, err)
-	infoSchema := infoSchemaBuilder.Build()
-	table, err := infoSchema.TableByName(util.InformationSchemaName, model.NewCIStr(infoschema.TableStatementsSummaryHistory))
+	infoSchema := infoSchemaBuilder.Build(math.MaxUint64)
+	table, err := infoSchema.TableByName(context.Background(), metadef.InformationSchemaName, ast.NewCIStr(infoschema.TableStatementsSummaryHistory))
 	require.NoError(t, err)
 	columns := table.Meta().Columns
 
@@ -167,7 +181,8 @@ func TestStmtSummaryRetriverV2_TableStatementsSummaryHistory(t *testing.T) {
 
 	ctx := context.Background()
 	sctx := mock.NewContext()
-	sctx.GetSessionVars().TimeZone, _ = time.LoadLocation("Asia/Shanghai")
+	tz, _ := time.LoadLocation("Asia/Shanghai")
+	sctx.ResetSessionAndStmtTimeZone(tz)
 
 	var results [][]types.Datum
 	for {
@@ -179,4 +194,58 @@ func TestStmtSummaryRetriverV2_TableStatementsSummaryHistory(t *testing.T) {
 		results = append(results, rows...)
 	}
 	require.Len(t, results, 7)
+}
+
+// TestStmtSummaryRetriverV2_TableTiDBStatementsStatsUnsupported verifies that
+// querying a cumulative statement summary table (TIDB_STATEMENTS_STATS) under
+// the v2 persistent path returns an explicit unsupported error instead of
+// panicking inside initSummaryRowsReader. The same guard fires for the
+// cluster cumulative variant (CLUSTER_TIDB_STATEMENTS_STATS), so both table
+// names are exercised.
+func TestStmtSummaryRetriverV2_TableTiDBStatementsStatsUnsupported(t *testing.T) {
+	cumulativeTables := []string{
+		infoschema.TableTiDBStatementsStats,
+		infoschema.ClusterTableTiDBStatementsStats,
+	}
+	for _, tableName := range cumulativeTables {
+		verifyCumulativeTableUnsupported(t, tableName)
+	}
+}
+
+// verifyCumulativeTableUnsupported builds a v2 retriever for the given
+// cumulative statement summary table and asserts the unsupported error is
+// returned instead of panicking. Defined as a helper so the stmtSummary
+// resource defer lives in its own scope, not inside the caller loop.
+func verifyCumulativeTableUnsupported(t *testing.T, tableName string) {
+	t.Helper()
+
+	data := infoschema.NewData()
+	schemaCacheSize := vardef.SchemaCacheSize.Load()
+	infoSchemaBuilder := infoschema.NewBuilder(nil, schemaCacheSize, nil, data, schemaCacheSize > 0)
+	err := infoSchemaBuilder.InitWithDBInfos(nil, nil, nil, nil, 0)
+	require.NoError(t, err)
+	infoSchema := infoSchemaBuilder.Build(math.MaxUint64)
+	table, err := infoSchema.TableByName(context.Background(), metadef.InformationSchemaName, ast.NewCIStr(tableName))
+	require.NoError(t, err)
+	columns := table.Meta().Columns
+
+	stmtSummary := stmtsummaryv2.NewStmtSummary4Test(1)
+	defer stmtSummary.Close()
+
+	retriever := stmtSummaryRetrieverV2{
+		stmtSummary: stmtSummary,
+		table:       table.Meta(),
+		columns:     columns,
+	}
+	require.NoError(t, retriever.close())
+
+	ctx := context.Background()
+	sctx := mock.NewContext()
+	tz, _ := time.LoadLocation("Asia/Shanghai")
+	sctx.ResetSessionAndStmtTimeZone(tz)
+
+	_, err = retriever.retrieve(ctx, sctx)
+	require.True(t, plannererrors.ErrNotSupportedYet.Equal(err), "table %s", tableName)
+	require.ErrorContains(t, err, "cumulative statement summary table with persistent mode (v2)")
+	require.Nil(t, retriever.rowsReader)
 }

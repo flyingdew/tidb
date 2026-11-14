@@ -94,7 +94,14 @@ var vecBuiltinMathCases = map[string][]vecExprBenchCase{
 		{retEvalType: types.ETDecimal, childrenTypes: []types.EvalType{types.ETDecimal}},
 		{retEvalType: types.ETDecimal, childrenTypes: []types.EvalType{types.ETDecimal, types.ETInt}},
 		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETInt}},
-		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETInt, types.ETInt}, geners: []dataGenerator{nil, newRangeInt64Gener(-100, 100)}},
+		// Rounding an exact-value number away from zero can push it out of
+		// BIGINT, which is an error rather than a value the two evaluation
+		// paths can compare, so keep the magnitude inside the range where no
+		// frac can overflow.
+		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETInt, types.ETInt}, geners: []dataGenerator{newRangeInt64Gener(-2e18, 2e18), newRangeInt64Gener(-100, 100)}},
+		// The default generator yields NULLs, and a non-negative frac returns
+		// every value unchanged.
+		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETInt, types.ETInt}, geners: []dataGenerator{nil, newRangeInt64Gener(0, 100)}},
 	},
 	ast.Pow: {
 		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETReal, types.ETReal}, geners: []dataGenerator{newRangeRealGener(0, 10, 0.5), newRangeRealGener(0, 100, 0.5)}},
@@ -134,6 +141,9 @@ var vecBuiltinMathCases = map[string][]vecExprBenchCase{
 			types.NewFieldTypeBuilder().SetType(mysql.TypeInt24).SetFlag(mysql.UnsignedFlag).BuildP(),
 		}, geners: []dataGenerator{nil, newRangeInt64Gener(-10, 10)}},
 		{retEvalType: types.ETDecimal, childrenTypes: []types.EvalType{types.ETDecimal, types.ETInt}},
+
+		// For issue 57651
+		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETReal, types.ETInt}, geners: []dataGenerator{newSelectRealGener([]float64{0, -0.1, 0.1, -1.1, 1.1}), newRangeInt64Gener(-1000, 1000)}},
 	},
 	ast.Rand: {
 		{retEvalType: types.ETReal, childrenTypes: []types.EvalType{types.ETInt}, geners: []dataGenerator{newDefaultGener(0, types.ETInt)}},

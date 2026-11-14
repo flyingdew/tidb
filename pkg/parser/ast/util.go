@@ -20,50 +20,61 @@ const (
 	UnspecifiedSize = math.MaxUint64
 )
 
-// IsReadOnly checks whether the input ast is readOnly.
-func IsReadOnly(node Node) bool {
+// IsReadOnly checks that the ast is readonly.  If checkGlobalVars is set to
+// true, then updates to global variables are counted as writes. Otherwise, if
+// this flag is false, they are ignored.
+func IsReadOnly(node Node, checkGlobalVars bool) bool {
 	switch st := node.(type) {
 	case *SelectStmt:
 		if st.LockInfo != nil {
 			switch st.LockInfo.LockType {
-			case SelectLockForUpdate, SelectLockForUpdateNoWait, SelectLockForUpdateWaitN:
+			case SelectLockForUpdate, SelectLockForUpdateNoWait, SelectLockForUpdateWaitN,
+				SelectLockForShare, SelectLockForShareNoWait:
 				return false
 			}
+		}
+
+		if !checkGlobalVars {
+			return true
 		}
 
 		checker := readOnlyChecker{
 			readOnly: true,
 		}
 
-		node.Accept(&checker)
+		Walk(node, &checker)
 		return checker.readOnly
 	case *ExplainStmt:
-		return !st.Analyze || IsReadOnly(st.Stmt)
+		return !st.Analyze || IsReadOnly(st.Stmt, checkGlobalVars)
 	case *DoStmt, *ShowStmt:
 		return true
+	case *RecommendIndexStmt:
+		return st.Action == RecommendIndexActionRun || st.Action == RecommendIndexActionReturn
 	case *SetOprStmt:
 		for _, sel := range node.(*SetOprStmt).SelectList.Selects {
-			if !IsReadOnly(sel) {
+			if !IsReadOnly(sel, checkGlobalVars) {
 				return false
 			}
 		}
 		return true
 	case *SetOprSelectList:
 		for _, sel := range node.(*SetOprSelectList).Selects {
-			if !IsReadOnly(sel) {
+			if !IsReadOnly(sel, checkGlobalVars) {
 				return false
 			}
 		}
 		return true
 	case *AdminStmt:
 		switch node.(*AdminStmt).Tp {
-		case AdminShowTelemetry, AdminShowDDL, AdminShowDDLJobs, AdminShowSlow,
+		case AdminShowDDL, AdminShowDDLJobs, AdminShowSlow,
 			AdminCaptureBindings, AdminShowNextRowID, AdminShowDDLJobQueries,
 			AdminShowDDLJobQueriesWithRange:
 			return true
 		default:
 			return false
 		}
+	case *TraceStmt:
+		return IsReadOnly(st.Stmt, checkGlobalVars)
 	default:
 		return false
 	}
@@ -77,19 +88,19 @@ type readOnlyChecker struct {
 	readOnly bool
 }
 
-// Enter implements Visitor interface.
-func (checker *readOnlyChecker) Enter(in Node) (out Node, skipChildren bool) {
+// Enter implements InPlaceVisitor interface.
+func (checker *readOnlyChecker) Enter(in Node) (skipChildren bool) {
 	if node, ok := in.(*VariableExpr); ok {
 		// like func rewriteVariable(), this stands for SetVar.
-		if !node.IsSystem && node.Value != nil {
+		if node.IsSystem && node.Value != nil {
 			checker.readOnly = false
-			return in, true
+			return true
 		}
 	}
-	return in, false
+	return false
 }
 
-// Leave implements Visitor interface.
-func (checker *readOnlyChecker) Leave(in Node) (out Node, ok bool) {
-	return in, checker.readOnly
+// Leave implements InPlaceVisitor interface.
+func (checker *readOnlyChecker) Leave(Node) (proceed bool) {
+	return checker.readOnly
 }

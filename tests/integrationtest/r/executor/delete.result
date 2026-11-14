@@ -114,11 +114,161 @@ delete from t where cast(id as unsigned) = 1;
 Error 1690 (22003): BIGINT value is out of range in '18446744073709551616'
 update t set id = '1' where cast(id as unsigned) = 1;
 Error 1690 (22003): BIGINT value is out of range in '18446744073709551616'
-set sql_mode=''
+set sql_mode='';
 delete from t where cast(id as unsigned) = 1;
 Level	Code	Message
 Warning	1292	Truncated incorrect INTEGER value: '18446744073709551616'
 update t set id = '1' where cast(id as unsigned) = 1;
 Level	Code	Message
 Warning	1292	Truncated incorrect INTEGER value: '18446744073709551616'
-set sql_mode=DEFAULT
+set sql_mode=DEFAULT;
+drop table if exists parent, child;
+create table parent (a int primary key);
+create table child (a int, foreign key (a) references parent(a));
+insert into parent values (1), (2);
+insert into child values (1);
+delete from parent where a = 1;
+Error 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails (`executor__delete`.`child`, CONSTRAINT `fk_1` FOREIGN KEY (`a`) REFERENCES `parent` (`a`))
+delete ignore from parent where a = 1;
+Level	Code	Message
+Warning	1451	Cannot delete or update a parent row: a foreign key constraint fails (`executor__delete`.`child`, CONSTRAINT `fk_1` FOREIGN KEY (`a`) REFERENCES `parent` (`a`))
+delete ignore from parent;
+Level	Code	Message
+Warning	1451	Cannot delete or update a parent row: a foreign key constraint fails (`executor__delete`.`child`, CONSTRAINT `fk_1` FOREIGN KEY (`a`) REFERENCES `parent` (`a`))
+select * from parent;
+a
+1
+insert into parent values (2);
+create table parent2 (a int primary key);
+create table child2 (a int, foreign key (a) references parent2(a));
+insert into parent2 values (1), (2);
+insert into child2 values (1);
+delete parent, parent2 from parent join parent2 on parent.a = parent2.a;
+Got one of the listed errors
+delete ignore parent, parent2 from parent join parent2 on parent.a = parent2.a;
+Level	Code	Message
+Warning	1451	Cannot delete or update a parent row: a foreign key constraint fails (`executor__delete`.`child2`, CONSTRAINT `fk_1` FOREIGN KEY (`a`) REFERENCES `parent2` (`a`))
+Warning	1451	Cannot delete or update a parent row: a foreign key constraint fails (`executor__delete`.`child`, CONSTRAINT `fk_1` FOREIGN KEY (`a`) REFERENCES `parent` (`a`))
+select * from parent;
+a
+1
+select * from parent2;
+a
+1
+batch on `a` limit 1000 delete from parent where a = 1;
+Error 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails (`executor__delete`.`child`, CONSTRAINT `fk_1` FOREIGN KEY (`a`) REFERENCES `parent` (`a`))
+batch on `a` limit 1000 delete ignore from parent where a = 1;
+number of jobs	job status
+1	all succeeded
+Level	Code	Message
+Warning	1451	Cannot delete or update a parent row: a foreign key constraint fails (`executor__delete`.`child`, CONSTRAINT `fk_1` FOREIGN KEY (`a`) REFERENCES `parent` (`a`))
+drop table if exists t, tx, t2;
+create table t (a int, b int) partition by range (a) (partition p0 values less than (10), partition p1 values less than maxvalue);
+insert into t values (1, 1);
+create table tx (a int, b int);
+insert into tx values (11, 1);
+alter table t exchange partition p1 with table tx;
+select *, _tidb_rowid from t order by a;
+a	b	_tidb_rowid
+1	1	1
+11	1	1
+create table t2 (b int);
+insert into t2 values (1);
+delete t from t join t2 on t.b = t2.b;
+affected rows: 2
+info: 
+select * from t;
+a	b
+select * from t2;
+b
+1
+drop table t, tx;
+create table t (a int, b int) partition by range (a) (partition p0 values less than (10), partition p1 values less than maxvalue);
+insert into t values (1, 1);
+create table tx (a int, b int);
+insert into tx values (11, 1);
+alter table t exchange partition p1 with table tx;
+delete t, t2 from t join t2 on t.b = t2.b;
+affected rows: 3
+info: 
+select * from t;
+a	b
+select * from t2;
+b
+drop table t, tx;
+create table t (a int, b int) partition by range (a) (partition p0 values less than (10), partition p1 values less than maxvalue);
+insert into t values (1, 1);
+create table tx (a int, b int);
+insert into tx values (11, 1);
+alter table t exchange partition p1 with table tx;
+delete t from t, (select 1) s where t.b = 1;
+affected rows: 2
+info: 
+select * from t;
+a	b
+drop table t, tx;
+create table t (a int, b int) partition by range (a) (partition p0 values less than (10), partition p1 values less than maxvalue);
+insert into t values (1, 1), (2, 2);
+create table tx (a int, b int);
+insert into tx values (11, 1), (12, 2);
+alter table t exchange partition p1 with table tx;
+select *, _tidb_rowid from t order by a;
+a	b	_tidb_rowid
+1	1	1
+2	2	2
+11	1	1
+12	2	2
+insert into t2 values (1), (1);
+delete t from t join t2 on t.b = t2.b;
+affected rows: 2
+info: 
+select *, _tidb_rowid from t order by a;
+a	b	_tidb_rowid
+2	2	2
+12	2	2
+insert into t2 values (2), (2);
+delete t, t2 from t join t2 on t.b = t2.b;
+affected rows: 4
+info: 
+select * from t;
+a	b
+select * from t2;
+b
+1
+1
+drop table t, tx;
+create table t (a int, b int) partition by range (a) (partition p0 values less than (10), partition p1 values less than maxvalue);
+insert into t values (1, 1);
+create table tx (a int, b int);
+insert into tx values (11, 1);
+alter table t exchange partition p1 with table tx;
+delete x, y from t x join t y on x.b = y.b;
+affected rows: 2
+info: 
+select * from t;
+a	b
+drop table t, tx;
+create table t (a int, b int, primary key (a) clustered) partition by range (a) (partition p0 values less than (10), partition p1 values less than maxvalue);
+insert into t values (1, 1), (2, 2);
+create table tx (a int, b int, primary key (a) clustered);
+insert into tx values (11, 1), (12, 2);
+alter table t exchange partition p1 with table tx;
+truncate table t2;
+insert into t2 values (1), (1);
+delete t from t join t2 on t.b = t2.b;
+affected rows: 2
+info: 
+select * from t;
+a	b
+12	2
+2	2
+drop table t;
+create table t (a int, b int);
+insert into t values (1, 1), (11, 1), (2, 2);
+delete t from t join t2 on t.b = t2.b;
+affected rows: 2
+info: 
+select * from t;
+a	b
+2	2
+drop table t, tx, t2;

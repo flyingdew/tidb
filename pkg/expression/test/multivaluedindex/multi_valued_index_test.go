@@ -20,7 +20,7 @@ import (
 
 	"github.com/pingcap/tidb/pkg/errno"
 	"github.com/pingcap/tidb/pkg/kv"
-	"github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/sessiontxn"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/tablecodec"
@@ -42,7 +42,7 @@ func TestWriteMultiValuedIndex(t *testing.T) {
 	tk.MustExec("insert into t1 values (5, null)")
 	tk.MustExec("insert into t1 values (6, '1')")
 
-	t1, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t1"))
+	t1, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	for _, index := range t1.Indices() {
 		if index.Meta().MVIndex {
@@ -76,7 +76,7 @@ func TestWriteMultiValuedIndex(t *testing.T) {
 	tk.MustExec("insert into t1 values (3, '[\"b   \"]')")
 	tk.MustQuery("select pk from t1 where 'b   ' member of (a)").Check(testkit.Rows("3"))
 
-	t1, err = dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t1"))
+	t1, err = dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	for _, index := range t1.Indices() {
 		if index.Meta().MVIndex {
@@ -122,7 +122,7 @@ func TestWriteMultiValuedIndex(t *testing.T) {
 	tk.MustExec("insert into t1 values (5, null)")
 	tk.MustExec("insert into t1 values (6, '1')")
 
-	t1, err = dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t1"))
+	t1, err = dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	for _, index := range t1.Indices() {
 		if index.Meta().MVIndex {
@@ -148,6 +148,16 @@ func TestWriteMultiValuedIndex(t *testing.T) {
 			checkCount(t, t1.IndexPrefix(), index, store, 0)
 		}
 	}
+
+	// A DOUBLE ARRAY MVIndex cannot distinguish every JSON number: the index range is built from float64,
+	// so integers above 2^53 may collapse into the same key. The JSON predicate must still be rechecked.
+	tk.MustExec("drop table t1")
+	tk.MustExec("create table t1(pk int primary key, a json, index idx((cast(a->'$' as double array))))")
+	tk.MustExec("insert into t1 values (1, '[9007199254740993]'), (2, '[9007199254740992]'), (3, '[42]')")
+	tk.MustExec("analyze table t1")
+	tk.MustQuery("select pk from t1 ignore index(idx) where json_overlaps(a->'$', '[9007199254740993]')").Check(testkit.Rows("1"))
+	tk.MustQuery("select pk from t1 use index(idx) where json_overlaps(a->'$', '[9007199254740993]')").Check(testkit.Rows("1"))
+	tk.MustExec("drop table t1")
 }
 
 func TestWriteMultiValuedIndexPartitionTable(t *testing.T) {
@@ -167,7 +177,7 @@ func TestWriteMultiValuedIndexPartitionTable(t *testing.T) {
 	tk.MustExec("insert into t1 values (3, null)")
 	tk.MustExec("insert into t1 values (13, null)")
 
-	t1, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t1"))
+	t1, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 
 	expect := map[string]struct {
@@ -221,7 +231,7 @@ func TestWriteMultiValuedIndexUnique(t *testing.T) {
 	tk.MustGetErrCode("insert into t1 values (2, '[1]')", errno.ErrDupEntry)
 	tk.MustExec("insert into t1 values (3, '[3,3,4]')")
 
-	t1, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t1"))
+	t1, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	for _, index := range t1.Indices() {
 		if index.Meta().MVIndex {
@@ -247,7 +257,7 @@ func TestWriteMultiValuedIndexComposite(t *testing.T) {
 	tk.MustExec("insert into t1 values (4, null, 4, 4)")
 	tk.MustExec("insert into t1 values (5, '[]', 5, 5)")
 
-	t1, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t1"))
+	t1, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t1"))
 	require.NoError(t, err)
 	for _, index := range t1.Indices() {
 		if index.Meta().MVIndex {

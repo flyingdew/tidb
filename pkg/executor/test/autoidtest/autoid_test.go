@@ -16,19 +16,63 @@ package autoid_test
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/pingcap/failpoint"
+	autoidpb "github.com/pingcap/kvproto/pkg/autoid"
 	_ "github.com/pingcap/tidb/pkg/autoid_service"
 	ddltestutil "github.com/pingcap/tidb/pkg/ddl/testutil"
+	"github.com/pingcap/tidb/pkg/kv"
+	metaautoid "github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testutil"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
+
+type rpcRetryLimitError struct {
+	cause error
+}
+
+func (e *rpcRetryLimitError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *rpcRetryLimitError) Cause() error {
+	return e.cause
+}
+
+func (e *rpcRetryLimitError) Unwrap() error {
+	return e.cause
+}
+
+func (*rpcRetryLimitError) AutoIDRPCRetryLimitReached() {}
+
+type rpcRetryLimitClient struct {
+	autoidpb.AutoIDAllocClient
+	err error
+}
+
+func (c *rpcRetryLimitClient) AllocAutoID(
+	context.Context,
+	*autoidpb.AutoIDRequest,
+	...grpc.CallOption,
+) (*autoidpb.AutoIDResponse, error) {
+	return nil, c.err
+}
+
+func (c *rpcRetryLimitClient) Rebase(
+	context.Context,
+	*autoidpb.RebaseRequest,
+	...grpc.CallOption,
+) (*autoidpb.RebaseResponse, error) {
+	return nil, c.err
+}
 
 // Test filter different kind of allocators.
 // In special ddl type, for example:
@@ -126,7 +170,7 @@ func testInsertWithAutoidSchema(t *testing.T, tk *testkit.TestKit) {
 	tests := []struct {
 		insert string
 		query  string
-		result [][]interface{}
+		result [][]any
 	}{
 		{
 			`insert into t1(id, n) values(1, 1)`,
@@ -548,6 +592,52 @@ func TestMockAutoIDServiceError(t *testing.T) {
 	defer failpoint.Disable("github.com/pingcap/tidb/pkg/autoid_service/mockErr")
 	// Cover a bug that the autoid client retry non-retryable errors forever cause dead loop.
 	tk.MustExecToErr("insert into t_mock_err values (),()") // mock error, instead of dead loop
+
+	t.Run("RPC retry limit error is not ignored", func(t *testing.T) {
+		const errMessage = "autoid alloc failed after reaching the RPC retry limit"
+		markedErr := &rpcRetryLimitError{
+			cause: metaautoid.ErrAutoincReadFailed.GenWithStack(errMessage),
+		}
+		require.True(t, metaautoid.IsRPCRetryLimitError(markedErr))
+
+		originalMockForTest := metaautoid.MockForTest
+		metaautoid.MockForTest = func(kv.Storage) autoidpb.AutoIDAllocClient {
+			return &rpcRetryLimitClient{err: markedErr}
+		}
+		t.Cleanup(func() {
+			metaautoid.MockForTest = originalMockForTest
+		})
+
+		markedStore := testkit.CreateMockStore(t)
+
+		cases := []struct {
+			name string
+			sql  string
+		}{
+			{name: "ordinary allocation", sql: "insert into %s (v) values (1)"},
+			{name: "ignored allocation", sql: "insert ignore into %s (v) values (1)"},
+			{name: "ignored batch allocation", sql: "insert ignore into %s (v) values (1), (2)"},
+			{name: "ignored eager allocation", sql: "insert ignore into %s (v) select 1"},
+			{name: "ignored explicit ID rebase", sql: "insert ignore into %s (id, v) values (100, 1)"},
+		}
+		for i, test := range cases {
+			t.Run(test.name, func(t *testing.T) {
+				markedTK := testkit.NewTestKit(t, markedStore)
+				markedTK.MustExec("use test")
+				tableName := "t_mock_terminal_" + strconv.Itoa(i)
+				markedTK.MustExec("create table " + tableName + " (id int key auto_increment, v int) auto_id_cache 1")
+				err := markedTK.ExecToErr(fmt.Sprintf(test.sql, tableName))
+				if err == nil {
+					t.Errorf("expected AutoID error for %s", test.sql)
+				} else {
+					require.True(t, metaautoid.ErrAutoincReadFailed.Equal(err))
+					require.True(t, metaautoid.IsRPCRetryLimitError(err))
+					require.Contains(t, err.Error(), errMessage)
+				}
+				markedTK.MustQuery("select id from " + tableName).Check(testkit.Rows())
+			})
+		}
+	})
 }
 
 func TestIssue39528(t *testing.T) {
@@ -566,4 +656,44 @@ func TestIssue39528(t *testing.T) {
 	require.NoError(t, err)
 	// Make sure the code does not visit tikv on allocate path.
 	require.False(t, codeRun)
+}
+
+func TestIssue52622(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec(`set @@auto_increment_increment = 66;`)
+	tk.MustExec(`set @@auto_increment_offset = 9527;`)
+
+	tk.MustQuery(`select @@auto_increment_increment;`).Check(testkit.Rows("66"))
+	tk.MustQuery(`select @@auto_increment_offset;`).Check(testkit.Rows("9527"))
+
+	for i := range 2 {
+		createTableSQL := "create table issue52622 (id int primary key auto_increment, k int)"
+		if i == 0 {
+			createTableSQL = createTableSQL + " AUTO_ID_CACHE 1"
+		}
+
+		tk.MustExec(createTableSQL)
+		tk.MustExec("insert into issue52622 (k) values (1),(2),(3);")
+		tk.MustQuery("select * from issue52622").Check(testkit.Rows("1 1", "67 2", "133 3"))
+		if i == 0 {
+			tk.MustQuery("show create table issue52622").CheckContain("134")
+		}
+		tk.MustExec("insert into issue52622 (k) values (4);")
+		tk.MustQuery("select * from issue52622").Check(testkit.Rows("1 1", "67 2", "133 3", "199 4"))
+
+		tk.MustExec("truncate table issue52622;")
+		tk.MustExec("insert into issue52622 (k) values (1)")
+		tk.MustExec("insert into issue52622 (k) values (2)")
+		tk.MustExec("insert into issue52622 (k) values (3)")
+		if i == 0 {
+			tk.MustQuery("show create table issue52622").CheckContain("134")
+		}
+		tk.MustExec("insert into issue52622 (k) values (4);")
+		tk.MustQuery("select * from issue52622").Check(testkit.Rows("1 1", "67 2", "133 3", "199 4"))
+
+		tk.MustExec("drop table issue52622;")
+	}
 }

@@ -16,6 +16,7 @@ package sessionstates_test
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"strconv"
@@ -24,6 +25,8 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/config/deploymode"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/errno"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/parser/auth"
@@ -31,9 +34,10 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/terror"
 	"github.com/pingcap/tidb/pkg/server"
 	"github.com/pingcap/tidb/pkg/sessionctx/sessionstates"
-	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/testkit"
-	"github.com/pingcap/tidb/pkg/util/sem"
+	sem "github.com/pingcap/tidb/pkg/util/sem/compat"
+	tidbtls "github.com/pingcap/tidb/pkg/util/tls"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,7 +76,7 @@ func TestUserVars(t *testing.T) {
 		tk2 := testkit.NewTestKit(t, store)
 		namesNum := strings.Count(tt, "%s")
 		names := make([]any, 0, namesNum)
-		for i := 0; i < namesNum; i++ {
+		for i := range namesNum {
 			names = append(names, fmt.Sprintf("a%d", i))
 		}
 		var sql string
@@ -92,6 +96,81 @@ func TestUserVars(t *testing.T) {
 }
 
 func TestSystemVars(t *testing.T) {
+	testSystemVars(t, sem.V1)
+	testSystemVars(t, sem.V2)
+}
+
+// TestSessionStatesReadTimestamps checks both the restored timestamp and whether
+// it applies to one read or remains active across subsequent reads.
+func TestSessionStatesReadTimestamps(t *testing.T) {
+	t.Run("destination DST gap", func(t *testing.T) {
+		store := testkit.CreateMockStore(t)
+		src := testkit.NewTestKit(t, store)
+		src.MustExec("set time_zone='+08:00'")
+		src.MustExec("set tx_read_ts='2024-03-10 02:30:00'")
+		state := src.MustQuery("show session_states").Rows()[0][0].(string)
+		wantTS := src.Session().GetSessionVars().TxnReadTS.PeakTxnReadTS()
+		require.NotZero(t, wantTS)
+		dst := testkit.NewTestKit(t, store)
+		// 02:30 is valid in the source timezone, but falls inside this zone's
+		// DST gap. SET SESSION_STATES starts with this statement timezone.
+		dst.MustExec("set time_zone='America/New_York'")
+		dst.MustExec("set session_states " + strconv.Quote(state))
+		require.Equal(t, wantTS, dst.Session().GetSessionVars().TxnReadTS.PeakTxnReadTS())
+	})
+	store := testkit.CreateMockStore(t)
+	writer := testkit.NewTestKit(t, store)
+	writer.MustExec("insert into mysql.tidb values ('tikv_gc_safe_point', '20160102-15:04:05 -0700', '') on duplicate key update variable_value='20160102-15:04:05 -0700'")
+	writer.MustExec("create table test.migration_snapshot (a int)")
+	writer.MustExec("insert into test.migration_snapshot values (1)")
+
+	for _, tt := range []struct {
+		name       string
+		stmts      []string
+		firstRead  string
+		secondRead string
+	}{
+		{"snapshot", []string{"set tidb_snapshot=@snap"}, "1", "1"},
+		{"snapshot after timezone change", []string{"set tidb_snapshot=@snap", "set time_zone='+00:00'"}, "1", "1"},
+		{"pending read timestamp", []string{"set tx_read_ts=@snap", "set time_zone='+00:00'"}, "1", "2"},
+		{"snapshot replaces read timestamp", []string{"set tx_read_ts=@snap", "set tidb_snapshot=@snap"}, "1", "1"},
+		{"read timestamp replaces snapshot", []string{"set tidb_snapshot=@snap", "set tx_read_ts=@snap"}, "1", "2"},
+		{"consumed read timestamp", []string{"set tx_read_ts=@snap", "select a from test.migration_snapshot"}, "2", "2"},
+		{"cleared snapshot", []string{"set tidb_snapshot=@snap", "set tidb_snapshot=''"}, "2", "2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			writer.MustExec("update test.migration_snapshot set a=1")
+			// A datetime snapshot has millisecond precision. Let the write's
+			// physical millisecond pass before capturing it without logical bits.
+			writer.MustQuery("select sleep(0.01)").Check(testkit.Rows("0"))
+			src := testkit.NewTestKit(t, store)
+			src.MustExec("set time_zone='+08:00'")
+			src.MustExec("set @snap=now(6)")
+			for _, stmt := range tt.stmts {
+				if strings.HasPrefix(stmt, "select") {
+					src.MustQuery(stmt).Check(testkit.Rows("1"))
+				} else {
+					src.MustExec(stmt)
+				}
+			}
+			writer.MustExec("update test.migration_snapshot set a=2")
+			state := src.MustQuery("show session_states").Rows()[0][0].(string)
+			vars := src.Session().GetSessionVars()
+			for range 20 {
+				dst := testkit.NewTestKit(t, store)
+				dst.MustExec("set time_zone='-07:00'")
+				dst.MustExec("set session_states " + strconv.Quote(state))
+				restored := dst.Session().GetSessionVars()
+				require.Equal(t, vars.SnapshotTS, restored.SnapshotTS)
+				require.Equal(t, vars.TxnReadTS.PeakTxnReadTS(), restored.TxnReadTS.PeakTxnReadTS())
+				dst.MustQuery("select a from test.migration_snapshot").Check(testkit.Rows(tt.firstRead))
+				dst.MustQuery("select a from test.migration_snapshot").Check(testkit.Rows(tt.secondRead))
+			}
+		})
+	}
+}
+
+func testSystemVars(t *testing.T, semVer string) {
 	store := testkit.CreateMockStore(t)
 
 	tests := []struct {
@@ -104,37 +183,37 @@ func TestSystemVars(t *testing.T) {
 		{
 			// normal variable
 			inSessionStates: true,
-			varName:         variable.TiDBMaxTiFlashThreads,
-			expectedValue:   strconv.Itoa(variable.DefTiFlashMaxThreads),
+			varName:         vardef.TiDBMaxTiFlashThreads,
+			expectedValue:   strconv.Itoa(vardef.DefTiFlashMaxThreads),
 		},
 		{
-			// hidden variable
-			inSessionStates: true,
-			varName:         variable.TiDBTxnReadTS,
+			// An inactive one-shot read timestamp must not be replayed.
+			inSessionStates: false,
+			varName:         vardef.TiDBTxnReadTS,
 			expectedValue:   "",
 		},
 		{
 			// none-scoped variable
 			inSessionStates: false,
-			varName:         variable.DataDir,
+			varName:         vardef.DataDir,
 			expectedValue:   "/usr/local/mysql/data/",
 		},
 		{
 			// instance-scoped variable
 			inSessionStates: false,
-			varName:         variable.TiDBGeneralLog,
+			varName:         vardef.TiDBGeneralLog,
 			expectedValue:   "0",
 		},
 		{
 			// global-scoped variable
 			inSessionStates: false,
-			varName:         variable.TiDBAutoAnalyzeStartTime,
-			expectedValue:   variable.DefAutoAnalyzeStartTime,
+			varName:         vardef.TiDBAutoAnalyzeStartTime,
+			expectedValue:   vardef.DefAutoAnalyzeStartTime,
 		},
 		{
 			// sem invisible variable
 			inSessionStates: false,
-			varName:         variable.TiDBConfig,
+			varName:         vardef.TiDBConfig,
 		},
 		{
 			// noop variables
@@ -151,25 +230,25 @@ func TestSystemVars(t *testing.T) {
 		},
 		{
 			inSessionStates: false,
-			varName:         variable.Timestamp,
+			varName:         vardef.Timestamp,
 		},
 		{
 			stmts:           []string{"set timestamp=100"},
 			inSessionStates: true,
-			varName:         variable.Timestamp,
+			varName:         vardef.Timestamp,
 			expectedValue:   "100",
 		},
 		{
 			stmts:           []string{"set rand_seed1=10000000, rand_seed2=1000000"},
 			inSessionStates: true,
-			varName:         variable.RandSeed1,
+			varName:         vardef.RandSeed1,
 			checkStmt:       "select rand()",
 			expectedValue:   "0.028870999839968048",
 		},
 		{
 			stmts:           []string{"set rand_seed1=10000000, rand_seed2=1000000", "select rand()"},
 			inSessionStates: true,
-			varName:         variable.RandSeed1,
+			varName:         vardef.RandSeed1,
 			checkStmt:       "select rand()",
 			expectedValue:   "0.11641535266900002",
 		},
@@ -181,8 +260,35 @@ func TestSystemVars(t *testing.T) {
 				"set @@tidb_enforce_mpp=1",
 			},
 			inSessionStates: true,
-			varName:         variable.TiDBEnforceMPPExecution,
+			varName:         vardef.TiDBEnforceMPPExecution,
 			expectedValue:   "1",
+		},
+		{
+			// Restore the charset before the non-default collation it would reset.
+			stmts:           []string{"set character_set_connection=utf8mb4", "set collation_connection=utf8mb4_general_ci"},
+			inSessionStates: true,
+			varName:         vardef.CollationConnection,
+			expectedValue:   "utf8mb4_general_ci",
+		},
+		{
+			// Restore the charset before the non-default collation it would reset.
+			stmts:           []string{"set character_set_database=utf8mb4", "set collation_database=utf8mb4_general_ci"},
+			inSessionStates: true,
+			varName:         vardef.CollationDatabase,
+			expectedValue:   "utf8mb4_general_ci",
+		},
+		{
+			// Restore the charset before the non-default collation it would reset.
+			stmts:           []string{"set character_set_server=utf8mb4", "set collation_server=utf8mb4_general_ci"},
+			inSessionStates: true,
+			varName:         vardef.CollationServer,
+			expectedValue:   "utf8mb4_general_ci",
+		},
+		{
+			stmts:           []string{"set tidb_skip_isolation_level_check=1", "set transaction_isolation='SERIALIZABLE'"},
+			inSessionStates: true,
+			varName:         vardef.TransactionIsolation,
+			expectedValue:   "SERIALIZABLE",
 		},
 		{
 			// tx_read_only depends on tidb_enable_noop_functions.
@@ -192,15 +298,12 @@ func TestSystemVars(t *testing.T) {
 				"set @@tx_read_only=1",
 			},
 			inSessionStates: true,
-			varName:         variable.TxReadOnly,
+			varName:         vardef.TxReadOnly,
 			expectedValue:   "1",
 		},
 	}
 
-	if !sem.IsEnabled() {
-		sem.Enable()
-		defer sem.Disable()
-	}
+	defer sem.SwitchToSEMForTest(t, semVer)()
 	for _, tt := range tests {
 		tk1 := testkit.NewTestKit(t, store)
 		for _, stmt := range tt.stmts {
@@ -240,6 +343,11 @@ func TestSystemVars(t *testing.T) {
 }
 
 func TestInvisibleVars(t *testing.T) {
+	testInvisibleVars(t, sem.V1)
+	testInvisibleVars(t, sem.V2)
+}
+
+func testInvisibleVars(t *testing.T, semVer string) {
 	tests := []struct {
 		hasPriv       bool
 		stmt          string
@@ -267,21 +375,21 @@ func TestInvisibleVars(t *testing.T) {
 			// The value is changed and the user has the privilege.
 			hasPriv:       true,
 			stmt:          "set tidb_opt_write_row_id=true",
-			varName:       variable.TiDBOptWriteRowID,
+			varName:       vardef.TiDBOptWriteRowID,
 			expectedValue: "1",
 		},
 		{
 			// The value has a global scope.
 			hasPriv:       true,
 			stmt:          "set tidb_row_format_version=1",
-			varName:       variable.TiDBRowFormatVersion,
+			varName:       vardef.TiDBRowFormatVersion,
 			expectedValue: "1",
 		},
 		{
 			// The global value is changed, so the session value is still different with global.
 			hasPriv:       true,
 			stmt:          "set global tidb_row_format_version=1",
-			varName:       variable.TiDBRowFormatVersion,
+			varName:       vardef.TiDBRowFormatVersion,
 			cleanStmt:     "set global tidb_row_format_version=2",
 			expectedValue: "2",
 		},
@@ -296,10 +404,7 @@ func TestInvisibleVars(t *testing.T) {
 
 	sessionstates.SetupSigningCertForTest(t)
 	store := testkit.CreateMockStore(t)
-	if !sem.IsEnabled() {
-		sem.Enable()
-		defer sem.Disable()
-	}
+	defer sem.SwitchToSEMForTest(t, semVer)()
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("CREATE USER u1, u2")
 	tk.MustExec("GRANT RESTRICTED_VARIABLES_ADMIN ON *.* to u1")
@@ -336,6 +441,39 @@ func TestInvisibleVars(t *testing.T) {
 	}
 }
 
+func TestIssue47665(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.Session().GetSessionVars().TLSConnectionState = &tls.ConnectionState{} // unrelated mock for the test.
+	originCfg := *config.GetGlobalConfig()
+	originalDeployMode := deploymode.Get()
+	originRequireSecureTransport := tidbtls.RequireSecureTransport.Load()
+	t.Cleanup(func() {
+		config.StoreGlobalConfig(&originCfg)
+		if kerneltype.IsNextGen() {
+			require.NoError(t, deploymode.Set(originalDeployMode))
+		}
+		tidbtls.RequireSecureTransport.Store(originRequireSecureTransport)
+	})
+	semCfg := originCfg
+	semCfg.Security.EnableSEM = true
+	config.StoreGlobalConfig(&semCfg)
+	tk.MustGetErrMsg("set @@global.require_secure_transport = on", "require_secure_transport can not be set to ON with SEM(security enhanced mode) enabled")
+	config.StoreGlobalConfig(&originCfg)
+	tk.MustExec("set @@global.require_secure_transport = on")
+	tk.MustExec("set @@global.require_secure_transport = off") // recover to default value
+	if kerneltype.IsNextGen() {
+		require.NoError(t, deploymode.Set(deploymode.Starter))
+		tk.MustQuery("select @@global.require_secure_transport").Check(testkit.Rows("1"))
+		tk.MustGetErrMsg("set @@global.require_secure_transport = on", "require_secure_transport can not be set in starter mode")
+		tk.MustGetErrMsg("set @@global.require_secure_transport = off", "require_secure_transport can not be set in starter mode")
+		require.NoError(t, deploymode.Set(originalDeployMode))
+	}
+	config.StoreGlobalConfig(&originCfg)
+	// StoreGlobalConfig does not restore the TLS atomic; it is restored by t.Cleanup.
+	tk.MustQuery("select @@global.require_secure_transport").Check(testkit.Rows("0"))
+}
+
 func TestSessionCtx(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)
@@ -364,7 +502,7 @@ func TestSessionCtx(t *testing.T) {
 		{
 			// check Status
 			checkFunc: func(tk *testkit.TestKit, param any) {
-				require.Equal(t, mysql.ServerStatusAutocommit, tk.Session().GetSessionVars().Status&mysql.ServerStatusAutocommit)
+				require.True(t, tk.Session().GetSessionVars().IsAutocommit())
 			},
 		},
 		{
@@ -374,7 +512,7 @@ func TestSessionCtx(t *testing.T) {
 				return nil
 			},
 			checkFunc: func(tk *testkit.TestKit, param any) {
-				require.Equal(t, uint16(0), tk.Session().GetSessionVars().Status&mysql.ServerStatusAutocommit)
+				require.False(t, tk.Session().GetSessionVars().IsAutocommit())
 			},
 		},
 		{
@@ -422,7 +560,7 @@ func TestSessionCtx(t *testing.T) {
 				return rows
 			},
 			checkFunc: func(tk *testkit.TestKit, param any) {
-				tk.MustQuery("select @@tidb_last_txn_info").Check(param.([][]interface{}))
+				tk.MustQuery("select @@tidb_last_txn_info").Check(param.([][]any))
 			},
 		},
 		{
@@ -433,7 +571,7 @@ func TestSessionCtx(t *testing.T) {
 				return rows
 			},
 			checkFunc: func(tk *testkit.TestKit, param any) {
-				tk.MustQuery("select @@tidb_last_query_info").Check(param.([][]interface{}))
+				tk.MustQuery("select @@tidb_last_query_info").Check(param.([][]any))
 			},
 		},
 		{
@@ -457,7 +595,7 @@ func TestSessionCtx(t *testing.T) {
 				return rows
 			},
 			checkFunc: func(tk *testkit.TestKit, param any) {
-				tk.MustQuery("select @@tidb_last_ddl_info").Check(param.([][]interface{}))
+				tk.MustQuery("select @@tidb_last_ddl_info").Check(param.([][]any))
 			},
 		},
 		{
@@ -469,7 +607,7 @@ func TestSessionCtx(t *testing.T) {
 				return rows
 			},
 			checkFunc: func(tk *testkit.TestKit, param any) {
-				tk.MustQuery("select @@tidb_last_ddl_info").Check(param.([][]interface{}))
+				tk.MustQuery("select @@tidb_last_ddl_info").Check(param.([][]any))
 			},
 		},
 		{
@@ -566,10 +704,10 @@ func TestSessionCtx(t *testing.T) {
 				return nil
 			},
 			checkFunc: func(tk *testkit.TestKit, param any) {
-				tk.MustQuery(`explain select id from test.t1`).Check(testkit.Rows(
-					`TableReader_12 10000.00 root  MppVersion: 2, data:ExchangeSender_11`,
-					`└─ExchangeSender_11 10000.00 mpp[tiflash]  ExchangeType: PassThrough`,
-					`  └─TableFullScan_10 10000.00 mpp[tiflash] table:t1 keep order:false, stats:pseudo`))
+				tk.MustQuery(`explain format = 'brief' select id from test.t1`).Check(testkit.Rows(
+					`TableReader 10000.00 root  MppVersion: 3, data:ExchangeSender`,
+					`└─ExchangeSender 10000.00 mpp[tiflash]  ExchangeType: PassThrough`,
+					`  └─TableFullScan 10000.00 mpp[tiflash] table:t1 keep order:false, stats:pseudo`))
 			},
 		},
 		{
@@ -581,9 +719,9 @@ func TestSessionCtx(t *testing.T) {
 				return nil
 			},
 			checkFunc: func(tk *testkit.TestKit, param any) {
-				tk.MustQuery(`explain select id from test.t1`).Check(testkit.Rows(
-					`TableReader_5 10000.00 root  data:TableFullScan_4`,
-					`└─TableFullScan_4 10000.00 cop[tikv] table:t1 keep order:false, stats:pseudo`))
+				tk.MustQuery(`explain format = 'brief' select id from test.t1`).Check(testkit.Rows(
+					`TableReader 10000.00 root  data:TableFullScan`,
+					`└─TableFullScan 10000.00 cop[tikv] table:t1 keep order:false, stats:pseudo`))
 			},
 		},
 		{
@@ -598,8 +736,8 @@ func TestSessionCtx(t *testing.T) {
 					"  `id` int(11) DEFAULT NULL,\n" +
 					"  KEY `hypo_id` (`id`) /* HYPO INDEX */\n" +
 					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
-				tk.MustQuery(`explain select id from test.t1`).Check(testkit.Rows(`IndexReader_7 10000.00 root  index:IndexFullScan_6`,
-					`└─IndexFullScan_6 10000.00 cop[tikv] table:t1, index:hypo_id(id) keep order:false, stats:pseudo`))
+				tk.MustQuery(`explain format = 'brief' select id from test.t1`).Check(testkit.Rows(`IndexReader 10000.00 root  index:IndexFullScan`,
+					`└─IndexFullScan 10000.00 cop[tikv] table:t1, index:hypo_id(id) keep order:false, stats:pseudo`))
 			},
 		},
 		{
@@ -614,8 +752,8 @@ func TestSessionCtx(t *testing.T) {
 				tk.MustQuery(`show create table test.t1`).Check(testkit.Rows("t1 CREATE TABLE `t1` (\n" +
 					"  `id` int(11) DEFAULT NULL\n" +
 					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
-				tk.MustQuery(`explain select id from test.t1`).Check(testkit.Rows(`TableReader_5 10000.00 root  data:TableFullScan_4`,
-					`└─TableFullScan_4 10000.00 cop[tikv] table:t1 keep order:false, stats:pseudo`))
+				tk.MustQuery(`explain format = 'brief' select id from test.t1`).Check(testkit.Rows(`TableReader 10000.00 root  data:TableFullScan`,
+					`└─TableFullScan 10000.00 cop[tikv] table:t1 keep order:false, stats:pseudo`))
 			},
 		},
 		{
@@ -671,6 +809,7 @@ func TestStatementCtx(t *testing.T) {
 				return nil
 			},
 			checkFunc: func(tk *testkit.TestKit, param any) {
+				require.Equal(t, uint64(0), tk.Session().AffectedRows())
 				tk.MustQuery("select row_count()").Check(testkit.Rows("-1"))
 			},
 		},
@@ -1373,6 +1512,45 @@ func TestSQLBinding(t *testing.T) {
 	}
 }
 
+func TestSQLBindingCompatibility(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("create table test.t1(id int primary key, name varchar(10), key(name))")
+
+	tests := []struct {
+		bindingStr     string
+		expectedResult []string
+	}{
+		// db is empty
+		{
+			bindingStr:     "{\"bindings\": \"[{\\\\\"OriginalSQL\\\\\":\\\\\"select * from `test` . `t1`\\\\\",\\\\\"Db\\\\\":\\\\\"\\\\\",\\\\\"Bindings\\\\\":[{\\\\\"BindSQL\\\\\":\\\\\"SELECT * FROM `test`.`t1` USE INDEX (`name`)\\\\\",\\\\\"Status\\\\\":\\\\\"enabled\\\\\",\\\\\"CreateTime\\\\\":2279073240653628855,\\\\\"UpdateTime\\\\\":2279073240653628855,\\\\\"Source\\\\\":\\\\\"manual\\\\\",\\\\\"Charset\\\\\":\\\\\"utf8mb4\\\\\",\\\\\"Collation\\\\\":\\\\\"utf8mb4_0900_ai_ci\\\\\",\\\\\"SQLDigest\\\\\":\\\\\"4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0\\\\\",\\\\\"PlanDigest\\\\\":\\\\\"\\\\\"}]}]\"}",
+			expectedResult: []string{"select * from `test` . `t1` SELECT * FROM `test`.`t1` USE INDEX (`name`)  enabled 2024-03-18 16:38:14.270 2024-03-18 16:38:14.270 utf8mb4 utf8mb4_0900_ai_ci manual 4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0 "},
+		},
+		// db is not empty
+		{
+			bindingStr:     "{\"bindings\": \"[{\\\\\"OriginalSQL\\\\\":\\\\\"select * from `t1`\\\\\",\\\\\"Db\\\\\":\\\\\"test\\\\\",\\\\\"Bindings\\\\\":[{\\\\\"BindSQL\\\\\":\\\\\"SELECT * FROM `test`.`t1` USE INDEX (`name`)\\\\\",\\\\\"Status\\\\\":\\\\\"enabled\\\\\",\\\\\"CreateTime\\\\\":2279073240653628855,\\\\\"UpdateTime\\\\\":2279073240653628855,\\\\\"Source\\\\\":\\\\\"manual\\\\\",\\\\\"Charset\\\\\":\\\\\"utf8mb4\\\\\",\\\\\"Collation\\\\\":\\\\\"utf8mb4_0900_ai_ci\\\\\",\\\\\"SQLDigest\\\\\":\\\\\"4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0\\\\\",\\\\\"PlanDigest\\\\\":\\\\\"\\\\\"}]}]\"}",
+			expectedResult: []string{"select * from `t1` SELECT * FROM `test`.`t1` USE INDEX (`name`) test enabled 2024-03-18 16:38:14.270 2024-03-18 16:38:14.270 utf8mb4 utf8mb4_0900_ai_ci manual 4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0 "},
+		},
+		// 2 bindings in 2 arrays
+		{
+			bindingStr:     "{\"bindings\": \"[{\\\\\"OriginalSQL\\\\\":\\\\\"select * from `t1`\\\\\",\\\\\"Db\\\\\":\\\\\"test\\\\\",\\\\\"Bindings\\\\\":[{\\\\\"BindSQL\\\\\":\\\\\"SELECT * FROM `test`.`t1` USE INDEX (`name`)\\\\\",\\\\\"Status\\\\\":\\\\\"enabled\\\\\",\\\\\"CreateTime\\\\\":2279073240653628855,\\\\\"UpdateTime\\\\\":2279073240653628855,\\\\\"Source\\\\\":\\\\\"manual\\\\\",\\\\\"Charset\\\\\":\\\\\"utf8mb4\\\\\",\\\\\"Collation\\\\\":\\\\\"utf8mb4_0900_ai_ci\\\\\",\\\\\"SQLDigest\\\\\":\\\\\"4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0\\\\\",\\\\\"PlanDigest\\\\\":\\\\\"\\\\\"}]}, {\\\\\"OriginalSQL\\\\\":\\\\\"select * from `test` . `t1`\\\\\",\\\\\"Db\\\\\":\\\\\"\\\\\",\\\\\"Bindings\\\\\":[{\\\\\"BindSQL\\\\\":\\\\\"SELECT * FROM `test`.`t1` USE INDEX (`name`)\\\\\",\\\\\"Status\\\\\":\\\\\"enabled\\\\\",\\\\\"CreateTime\\\\\":2279073240653628855,\\\\\"UpdateTime\\\\\":2279073240653628855,\\\\\"Source\\\\\":\\\\\"manual\\\\\",\\\\\"Charset\\\\\":\\\\\"utf8mb4\\\\\",\\\\\"Collation\\\\\":\\\\\"utf8mb4_0900_ai_ci\\\\\",\\\\\"SQLDigest\\\\\":\\\\\"4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0\\\\\",\\\\\"PlanDigest\\\\\":\\\\\"\\\\\"}]}]\"}",
+			expectedResult: []string{"select * from `t1` SELECT * FROM `test`.`t1` USE INDEX (`name`) test enabled 2024-03-18 16:38:14.270 2024-03-18 16:38:14.270 utf8mb4 utf8mb4_0900_ai_ci manual 4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0 ", "select * from `test` . `t1` SELECT * FROM `test`.`t1` USE INDEX (`name`)  enabled 2024-03-18 16:38:14.270 2024-03-18 16:38:14.270 utf8mb4 utf8mb4_0900_ai_ci manual 4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0 "},
+		},
+		// 2 bindings in 1 array, one is enabled while another is disabled
+		{
+			bindingStr:     "{\"bindings\": \"[{\\\\\"OriginalSQL\\\\\":\\\\\"select * from `t1`\\\\\",\\\\\"Db\\\\\":\\\\\"test\\\\\",\\\\\"Bindings\\\\\":[{\\\\\"BindSQL\\\\\":\\\\\"SELECT * FROM `test`.`t1` USE INDEX (`name`)\\\\\",\\\\\"Status\\\\\":\\\\\"enabled\\\\\",\\\\\"CreateTime\\\\\":2279073240653628855,\\\\\"UpdateTime\\\\\":2279073240653628855,\\\\\"Source\\\\\":\\\\\"manual\\\\\",\\\\\"Charset\\\\\":\\\\\"utf8mb4\\\\\",\\\\\"Collation\\\\\":\\\\\"utf8mb4_0900_ai_ci\\\\\",\\\\\"SQLDigest\\\\\":\\\\\"4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0\\\\\",\\\\\"PlanDigest\\\\\":\\\\\"\\\\\"}, {\\\\\"BindSQL\\\\\":\\\\\"SELECT * FROM `test`.`t1` USE INDEX (`primary`)\\\\\",\\\\\"Status\\\\\":\\\\\"disabled\\\\\",\\\\\"CreateTime\\\\\":2279073240653628855,\\\\\"UpdateTime\\\\\":2279073240653628855,\\\\\"Source\\\\\":\\\\\"manual\\\\\",\\\\\"Charset\\\\\":\\\\\"utf8mb4\\\\\",\\\\\"Collation\\\\\":\\\\\"utf8mb4_0900_ai_ci\\\\\",\\\\\"SQLDigest\\\\\":\\\\\"4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0\\\\\",\\\\\"PlanDigest\\\\\":\\\\\"\\\\\"}]}]\"}",
+			expectedResult: []string{"select * from `t1` SELECT * FROM `test`.`t1` USE INDEX (`primary`) test disabled 2024-03-18 16:38:14.270 2024-03-18 16:38:14.270 utf8mb4 utf8mb4_0900_ai_ci manual 4ea0618129ffc6a7effbc0eff4bbcb41a7f5d4c53a6fa0b2e9be81c7010915b0 "},
+		},
+	}
+
+	for _, test := range tests {
+		setSQL := fmt.Sprintf("set session_states '%s'", test.bindingStr)
+		tk := testkit.NewTestKit(t, store)
+		tk.MustExec(setSQL)
+		tk.MustQuery("show session bindings").Sort().Check(testkit.Rows(test.expectedResult...))
+	}
+}
+
 func TestShowStateFail(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	sv := server.CreateMockServer(t, store)
@@ -1639,7 +1817,7 @@ func getExecuteBytes(stmtID uint32, useCursor bool, newParam bool, params ...par
 	if newParam {
 		buf[pos] = 1
 		pos++
-		for i := 0; i < len(params); i++ {
+		for range params {
 			buf[pos] = mysql.TypeLong
 			pos++
 			buf[pos] = 0

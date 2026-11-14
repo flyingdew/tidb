@@ -27,8 +27,7 @@ type Key interface {
 }
 
 // Value is the interface that every value in LRU Cache should implement.
-type Value interface {
-}
+type Value any
 
 // cacheEntry wraps Key and Value. It's the value of list.Element.
 type cacheEntry struct {
@@ -92,6 +91,15 @@ func (l *SimpleLRUCache) Get(key Key) (value Value, ok bool) {
 		return nil, false
 	}
 	l.cache.MoveToFront(element)
+	return element.Value.(*cacheEntry).value, true
+}
+
+// Peek tries to find the corresponding value without updating its LRU position.
+func (l *SimpleLRUCache) Peek(key Key) (value Value, ok bool) {
+	element, exists := l.elements[string(key.Hash())]
+	if !exists {
+		return nil, false
+	}
 	return element.Value.(*cacheEntry).value, true
 }
 

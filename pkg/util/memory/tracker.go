@@ -25,12 +25,16 @@ import (
 	"time"
 
 	"github.com/pingcap/tidb/pkg/metrics"
+	"github.com/pingcap/tidb/pkg/util/intest"
 	"github.com/pingcap/tidb/pkg/util/sqlkiller"
 	atomicutil "go.uber.org/atomic"
 )
 
 // TrackMemWhenExceeds is the threshold when memory usage needs to be tracked.
 const TrackMemWhenExceeds = 104857600 // 100MB
+
+// DefMemQuotaQuery is default memory quota for query.
+const DefMemQuotaQuery = 1073741824 // 1GB
 
 // Process global variables for memory limit.
 var (
@@ -72,26 +76,24 @@ var (
 // The actions that could be triggered are: SpillDiskAction, SortAndSpillDiskAction, rateLimitAction,
 // PanicOnExceed, globalPanicOnExceed, LogOnExceed.
 type Tracker struct {
+	parent               atomic.Pointer[Tracker]
+	MemArbitrator        *memArbitrator
+	Killer               *sqlkiller.SQLKiller
 	bytesLimit           atomic.Pointer[bytesLimits]
 	actionMuForHardLimit actionMu
 	actionMuForSoftLimit actionMu
-	Killer               *sqlkiller.SQLKiller
 	mu                   struct {
 		// The children memory trackers. If the Tracker is the Global Tracker, like executor.GlobalDiskUsageTracker,
 		// we wouldn't maintain its children in order to avoiding mutex contention.
 		children map[int][]*Tracker
 		sync.Mutex
 	}
-	parMu struct {
-		parent *Tracker // The parent memory tracker.
-		sync.Mutex
-	}
 	label int // Label of this "Tracker".
 	// following fields are used with atomic operations, so make them 64-byte aligned.
-	bytesConsumed       int64             // Consumed bytes.
 	bytesReleased       int64             // Released bytes.
 	maxConsumed         atomicutil.Int64  // max number of bytes consumed during execution.
 	SessionID           atomicutil.Uint64 // SessionID indicates the sessionID the tracker is bound.
+	bytesConsumed       int64             // Consumed bytes.
 	IsRootTrackerOfSess bool              // IsRootTrackerOfSess indicates whether this tracker is bound for session
 	isGlobal            bool              // isGlobal indicates whether this tracker is global tracker
 }
@@ -107,7 +109,7 @@ var EnableGCAwareMemoryTrack = atomicutil.NewBool(false)
 // https://golang.google.cn/pkg/runtime/#SetFinalizer
 // It is not guaranteed that a finalizer will run if the size of *obj is zero bytes.
 type finalizerRef struct {
-	byte //nolint:unused
+	_ byte //nolint:unused
 }
 
 // softScale means the scale of the soft limit to the hard limit.
@@ -119,8 +121,23 @@ type bytesLimits struct {
 	bytesSoftLimit int64 // bytesSoftLimit <= 0 means no limit, used for actionMuForSoftLimit.
 }
 
+var unlimitedBytesLimit = bytesLimits{
+	bytesHardLimit: -1,
+	bytesSoftLimit: -1,
+}
+
+var defaultQueryQuota = bytesLimits{
+	bytesHardLimit: DefMemQuotaQuery,
+	bytesSoftLimit: DefMemQuotaQuery * 8 / 10,
+}
+
 // MemUsageTop1Tracker record the use memory top1 session's tracker for kill.
 var MemUsageTop1Tracker atomic.Pointer[Tracker]
+
+var (
+	mockDebugInject                  func()
+	mockConsumeAfterStateCheckInject func(*memArbitrator)
+)
 
 // InitTracker initializes a memory tracker.
 //  1. "label" is the label used in the usage string.
@@ -131,13 +148,19 @@ func InitTracker(t *Tracker, label int, bytesLimit int64, action ActionOnExceed)
 	t.mu.children = nil
 	t.actionMuForHardLimit.actionOnExceed = action
 	t.actionMuForSoftLimit.actionOnExceed = nil
-	t.parMu.parent = nil
+	t.parent.Store(nil)
 
 	t.label = label
-	t.bytesLimit.Store(&bytesLimits{
-		bytesHardLimit: bytesLimit,
-		bytesSoftLimit: int64(float64(bytesLimit) * softScale),
-	})
+	if bytesLimit <= 0 {
+		t.bytesLimit.Store(&unlimitedBytesLimit)
+	} else if bytesLimit == DefMemQuotaQuery {
+		t.bytesLimit.Store(&defaultQueryQuota)
+	} else {
+		t.bytesLimit.Store(&bytesLimits{
+			bytesHardLimit: bytesLimit,
+			bytesSoftLimit: int64(float64(bytesLimit) * softScale),
+		})
+	}
 	t.maxConsumed.Store(0)
 	t.isGlobal = false
 }
@@ -183,10 +206,16 @@ func (t *Tracker) CheckBytesLimit(val int64) bool {
 // SetBytesLimit sets the bytes limit for this tracker.
 // "bytesHardLimit <= 0" means no limit.
 func (t *Tracker) SetBytesLimit(bytesLimit int64) {
-	t.bytesLimit.Store(&bytesLimits{
-		bytesHardLimit: bytesLimit,
-		bytesSoftLimit: int64(float64(bytesLimit) * softScale),
-	})
+	if bytesLimit <= 0 {
+		t.bytesLimit.Store(&unlimitedBytesLimit)
+	} else if bytesLimit == DefMemQuotaQuery {
+		t.bytesLimit.Store(&defaultQueryQuota)
+	} else {
+		t.bytesLimit.Store(&bytesLimits{
+			bytesHardLimit: bytesLimit,
+			bytesSoftLimit: int64(float64(bytesLimit) * softScale),
+		})
+	}
 }
 
 // GetBytesLimit gets the bytes limit for this tracker.
@@ -204,8 +233,8 @@ func (t *Tracker) CheckExceed() bool {
 // SetActionOnExceed sets the action when memory usage exceeds bytesHardLimit.
 func (t *Tracker) SetActionOnExceed(a ActionOnExceed) {
 	t.actionMuForHardLimit.Lock()
+	defer t.actionMuForHardLimit.Unlock()
 	t.actionMuForHardLimit.actionOnExceed = a
-	t.actionMuForHardLimit.Unlock()
 }
 
 // FallbackOldAndSetNewAction sets the action when memory usage exceeds bytesHardLimit
@@ -242,7 +271,30 @@ func (t *Tracker) UnbindActions() {
 
 	t.actionMuForHardLimit.Lock()
 	defer t.actionMuForHardLimit.Unlock()
-	t.actionMuForHardLimit.actionOnExceed = &LogOnExceed{}
+	// Currently this method is only called by ResetContextOfStmt, which then always calls SetActionOnExceed to set
+	// actionForHardLimit.actionOnExceed properly, thus it's safe to set it nil here.
+	t.actionMuForHardLimit.actionOnExceed = nil
+}
+
+// UnbindActionFromHardLimit unbinds action from hardLimit.
+func (t *Tracker) UnbindActionFromHardLimit(actionToUnbind ActionOnExceed) {
+	t.actionMuForHardLimit.Lock()
+	defer t.actionMuForHardLimit.Unlock()
+
+	var prev ActionOnExceed
+	for current := t.actionMuForHardLimit.actionOnExceed; current != nil; current = current.GetFallback() {
+		if current == actionToUnbind {
+			if prev == nil {
+				// actionToUnbind is the first element
+				t.actionMuForHardLimit.actionOnExceed = current.GetFallback()
+			} else {
+				// actionToUnbind is not the first element
+				prev.SetFallback(current.GetFallback())
+			}
+			break
+		}
+		prev = current
+	}
 }
 
 // reArrangeFallback merge two action chains and rearrange them by priority in descending order.
@@ -311,6 +363,10 @@ func (t *Tracker) Detach() {
 		t.DetachFromGlobalTracker()
 		return
 	}
+	exception := false // record whether the session is killed before resetting the killer
+	if m := t.MemArbitrator; m != nil && m.killer != nil {
+		exception = m.killer.Signal != 0
+	}
 	if parent.IsRootTrackerOfSess && t.label != LabelForMemDB {
 		parent.actionMuForHardLimit.Lock()
 		parent.actionMuForHardLimit.actionOnExceed = nil
@@ -322,9 +378,8 @@ func (t *Tracker) Detach() {
 		parent.Killer.Reset()
 	}
 	parent.remove(t)
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.setParent(nil)
+	t.setParent(nil) //atomic operator
+	t.DetachMemArbitrator(exception)
 }
 
 func (t *Tracker) remove(oldChild *Tracker) {
@@ -335,7 +390,7 @@ func (t *Tracker) remove(oldChild *Tracker) {
 		children := t.mu.children[label]
 		for i, child := range children {
 			if child == oldChild {
-				children = append(children[:i], children[i+1:]...)
+				children = slices.Delete(children, i, i+1)
 				if len(children) > 0 {
 					t.mu.children[label] = children
 				} else {
@@ -392,10 +447,48 @@ func (t *Tracker) ReplaceChild(oldChild, newChild *Tracker) {
 	t.Consume(newConsumed)
 }
 
+type reversalRes struct {
+	m     *memArbitrator
+	delta int64
+}
+
+// Release removes the temporary reversal from the arbitrator's budget. The
+// caller must invoke it exactly once after the corresponding allocation window
+// has ended.
+func (r *reversalRes) Release() {
+	if r.m != nil && r.delta > 0 {
+		r.m.budget.reversal.Add(-r.delta)
+	}
+}
+
+// AddReversal temporarily offsets global memory-arbitrator accounting for
+// memory that has been charged to the tracker but whose backing allocation is
+// still being materialized. It returns a handle for the nearest arbitrator;
+// the caller must release that handle exactly once when the allocation window
+// ends.
+func (t *Tracker) AddReversal(delta int64) (res reversalRes) {
+	if delta <= 0 {
+		return
+	}
+	for tracker := t; tracker != nil; tracker = tracker.getParent() {
+		if m := tracker.MemArbitrator; m != nil {
+			m.budget.reversal.Add(delta)
+			res.delta = delta
+			res.m = m
+			break
+		}
+	}
+	return
+}
+
 // Consume is used to consume a memory usage. "bytes" can be a negative value,
 // which means this is a memory release operation. When memory usage of a tracker
 // exceeds its bytesSoftLimit/bytesHardLimit, the tracker calls its action, so does each of its ancestors.
 func (t *Tracker) Consume(bs int64) {
+	t.consume(bs, true)
+}
+
+func (t *Tracker) consume(bs int64, enforce bool) {
 	if bs == 0 {
 		return
 	}
@@ -403,6 +496,41 @@ func (t *Tracker) Consume(bs int64) {
 	for tracker := t; tracker != nil; tracker = tracker.getParent() {
 		if tracker.IsRootTrackerOfSess {
 			sessionRootTracker = tracker
+		}
+		if m := tracker.MemArbitrator; m != nil {
+			if m.state.Load() != memArbitratorStateDown {
+				if intest.InTest {
+					if mockConsumeAfterStateCheckInject != nil {
+						mockConsumeAfterStateCheckInject(m)
+					}
+				}
+				if bs > 0 {
+					if m.useBigBudget() {
+						if m.addBigBudgetUsed(bs) > m.bigBudgetGrowThreshold() && enforce {
+							m.growBigBudget()
+						}
+					} else { // fast path for small budget
+						if m.addSmallBudget(bs) > m.budget.smallLimit && enforce {
+							m.intoBigBudget()
+						} else {
+							b := m.smallBudget()
+							if t := m.approxUnixTimeSec(); b.getLastUsedTimeSec() != t {
+								b.setLastUsedTimeSec(t)
+							}
+							if enforce && b.Used.Load() > b.approxCapacity() && b.PullFromUpstream() != nil {
+								m.intoBigBudget()
+							}
+						}
+					}
+				} else if m.useBigBudget() { // delta <= 0 && use big budget
+					m.addBigBudgetUsed(bs)
+				} else { // delta <= 0 && use small budget
+					m.addSmallBudget(bs)
+				}
+				if m.state.Load() == memArbitratorStateDown {
+					m.cleanSmallBudget()
+				}
+			}
 		}
 		bytesConsumed := atomic.AddInt64(&tracker.bytesConsumed, bs)
 		bytesReleased := atomic.LoadInt64(&tracker.bytesReleased)
@@ -419,6 +547,10 @@ func (t *Tracker) Consume(bs int64) {
 			consumed := atomic.LoadInt64(&tracker.bytesConsumed)
 			if consumed > maxNow && !tracker.maxConsumed.CompareAndSwap(maxNow, consumed) {
 				continue
+			}
+			if tracker.label == LabelForGlobalAnalyzeMemory {
+				// `LabelForGlobalAnalyzeMemory` represents in-use memory, which should never be negative.
+				intest.Assert(consumed >= 0, fmt.Sprintf("global analyze memory usage negative: %d", consumed))
 			}
 			if label, ok := MetricsTypes[tracker.label]; ok {
 				metrics.MemoryUsage.WithLabelValues(label[0], label[1]).Set(float64(consumed))
@@ -438,7 +570,7 @@ func (t *Tracker) Consume(bs int64) {
 		}
 	}
 
-	if bs > 0 && sessionRootTracker != nil {
+	if bs > 0 && !UsingGlobalMemArbitration() && sessionRootTracker != nil {
 		// Update the Top1 session
 		memUsage := sessionRootTracker.BytesConsumed()
 		limitSessMinSize := ServerMemoryLimitSessMinSize.Load()
@@ -451,6 +583,10 @@ func (t *Tracker) Consume(bs int64) {
 				oldTracker = MemUsageTop1Tracker.Load()
 			}
 		}
+	}
+
+	if !enforce {
+		return
 	}
 
 	if bs > 0 && sessionRootTracker != nil {
@@ -466,6 +602,23 @@ func (t *Tracker) Consume(bs int64) {
 
 	if bs > 0 && rootExceedForSoftLimit != nil {
 		tryAction(&rootExceedForSoftLimit.actionMuForSoftLimit, rootExceedForSoftLimit)
+	}
+}
+
+// HandleKillSignal checks if a kill signal has been sent to the session root tracker.
+// If a kill signal is detected, it panics with the error returned by the signal handler.
+func (t *Tracker) HandleKillSignal() {
+	var sessionRootTracker *Tracker
+	for tracker := t; tracker != nil; tracker = tracker.getParent() {
+		if tracker.IsRootTrackerOfSess {
+			sessionRootTracker = tracker
+		}
+	}
+	if sessionRootTracker != nil {
+		err := sessionRootTracker.Killer.HandleSignal()
+		if err != nil {
+			panic(err)
+		}
 	}
 }
 
@@ -492,7 +645,7 @@ func (t *Tracker) Release(bytes int64) {
 			// use fake ref instead of obj ref, otherwise obj will be reachable again and gc in next cycle
 			newRef := &finalizerRef{}
 			finalizer := func(tracker *Tracker) func(ref *finalizerRef) {
-				return func(ref *finalizerRef) {
+				return func(*finalizerRef) {
 					tracker.release(bytes) // finalizer func is called async
 				}
 			}
@@ -650,20 +803,13 @@ func BytesToString(numBytes int64) string {
 	return fmt.Sprintf("%v Bytes", numBytes)
 }
 
-const (
-	byteSizeGB = int64(1 << 30)
-	byteSizeMB = int64(1 << 20)
-	byteSizeKB = int64(1 << 10)
-	byteSizeBB = int64(1)
-)
-
 // FormatBytes uses to format bytes, this function will prune precision before format bytes.
 func FormatBytes(numBytes int64) string {
 	if numBytes <= byteSizeKB {
 		return BytesToString(numBytes)
 	}
 	unit, unitStr := getByteUnit(numBytes)
-	if unit == byteSizeBB {
+	if unit == byteSize {
 		return BytesToString(numBytes)
 	}
 	v := float64(numBytes) / float64(unit)
@@ -684,7 +830,7 @@ func getByteUnit(b int64) (int64, string) {
 	} else if b > byteSizeKB {
 		return byteSizeKB, "KB"
 	}
-	return byteSizeBB, "Bytes"
+	return byteSize, "Bytes"
 }
 
 // AttachToGlobalTracker attach the tracker to the global tracker
@@ -728,6 +874,15 @@ func (t *Tracker) ReplaceBytesUsed(bytes int64) {
 	t.Consume(bytes - t.BytesConsumed())
 }
 
+// ReplaceBytesUsedForCleanup reconciles previously allocated memory during
+// teardown. It updates accounting without checking kill signals, running
+// quota actions, or reserving additional memory from the arbitrator. It must not
+// be used to admit new allocations; subsequent Consume calls enforce limits as
+// usual. Like ReplaceBytesUsed, concurrent replacements are not supported.
+func (t *Tracker) ReplaceBytesUsedForCleanup(bytes int64) {
+	t.consume(bytes-t.BytesConsumed(), false)
+}
+
 // Reset detach the tracker from the old parent and clear the old children. The label and byteLimit would not be reset.
 func (t *Tracker) Reset() {
 	t.Detach()
@@ -736,15 +891,11 @@ func (t *Tracker) Reset() {
 }
 
 func (t *Tracker) getParent() *Tracker {
-	t.parMu.Lock()
-	defer t.parMu.Unlock()
-	return t.parMu.parent
+	return t.parent.Load()
 }
 
 func (t *Tracker) setParent(parent *Tracker) {
-	t.parMu.Lock()
-	defer t.parMu.Unlock()
-	t.parMu.parent = parent
+	t.parent.Store(parent)
 }
 
 // CountAllChildrenMemUse return memory used tree for the tracker
@@ -841,10 +992,431 @@ const (
 	LabelForCursorFetch int = -29
 	// LabelForChunkDataInDiskByChunks represents the label of the chunk list in disk
 	LabelForChunkDataInDiskByChunks int = -30
+	// LabelForSortPartition represents the label of the sort partition
+	LabelForSortPartition int = -31
+	// LabelForHashTableInHashJoinV2 represents the label of the hash join v2's hash table
+	LabelForHashTableInHashJoinV2 int = -32
 )
 
 // MetricsTypes is used to get label for metrics
 // string[0] is LblModule, string[1] is heap-in-use type, string[2] is released type
 var MetricsTypes = map[int][]string{
 	LabelForGlobalAnalyzeMemory: {"analyze", "inuse", "released"},
+}
+
+const (
+	memArbitratorStateSmallBudget   int32 = iota // using small budget
+	memArbitratorStateIntoBigBudget              // initializing big budget from small budget
+	memArbitratorStateBigBudget                  // using big budget
+	memArbitratorStateDown                       // down
+)
+
+type memArbitrator struct {
+	*MemArbitrator
+	ctx    ArbitrationContext
+	killer *sqlkiller.SQLKiller
+	budget struct {
+		smallB *TrackedConcurrentBudget
+		mu     struct {
+			bigB      ConcurrentBudget // bigB.Used (aks growThreshold): threshold to pull from upstream (95% * bigB.Capacity)
+			bigUsed   atomic.Int64     // bigUsed <= growThreshold <= bigB.Capacity
+			smallUsed atomic.Int64
+			_         cpuCacheLinePad
+		}
+		smallLimit int64
+		reversal   atomic.Int64
+		useBig     atomic.Bool
+	}
+	uid         uint64
+	digestID    uint64 // identify the digest profile of root-pool / SQL
+	reserveSize int64
+	isInternal  bool
+	state       struct {
+		sync.Mutex
+		atomic.Int32 // states: the current state of memArbitrator
+	}
+	preMaxMem int64
+
+	AwaitAlloc struct {
+		TotalDur   atomic.Int64 // total time spent waiting for memory allocation in nanoseconds
+		StartUtime int64        // start time of the last allocation attempt in nanoseconds.
+		Size       int64        // size of the last allocation attempt in bytes. 0 means no allocation attempt is in progress.
+	}
+}
+
+func (m *memArbitrator) bigBudget() *ConcurrentBudget {
+	return &m.budget.mu.bigB
+}
+
+func (m *memArbitrator) smallBudget() *TrackedConcurrentBudget {
+	return m.budget.smallB
+}
+
+func (m *memArbitrator) bigBudgetGrowThreshold() int64 {
+	return m.bigBudget().Used.Load()
+}
+
+func (m *memArbitrator) bigBudgetCap() int64 {
+	return m.bigBudget().approxCapacity()
+}
+
+func (m *memArbitrator) bigBudgetUsed() int64 {
+	return m.budget.mu.bigUsed.Load()
+}
+
+func (m *memArbitrator) setBigBudgetGrowThreshold(x int64) {
+	m.bigBudget().Used.Store(x)
+}
+
+func (m *memArbitrator) doSetBigBudgetCap(x int64) {
+	m.bigBudget().Capacity = x
+}
+
+func (m *memArbitrator) addBigBudgetUsed(d int64) int64 {
+	return m.budget.mu.bigUsed.Add(d)
+}
+
+func (m *memArbitrator) smallBudgetUsed() int64 {
+	return m.budget.mu.smallUsed.Load()
+}
+
+func (m *memArbitrator) addSmallBudget(d int64) int64 {
+	m.smallBudget().HeapInuse.Add(d)
+	m.smallBudget().Used.Add(d)
+	return m.budget.mu.smallUsed.Add(d)
+}
+
+func (m *memArbitrator) cleanSmallBudget() (res int64) {
+	res = m.budget.mu.smallUsed.Swap(0)
+	if res != 0 {
+		m.smallBudget().HeapInuse.Add(-res)
+		m.smallBudget().Used.Add(-res)
+	}
+	return res
+}
+
+func (m *memArbitrator) useBigBudget() bool {
+	return m.budget.useBig.Load()
+}
+
+// MemArbitration returns the time cost of memory arbitration in nanoseconds
+func (t *Tracker) MemArbitration() time.Duration {
+	if t == nil {
+		return 0
+	}
+	m := t.MemArbitrator
+	if m == nil {
+		return 0
+	}
+	return time.Duration(m.AwaitAlloc.TotalDur.Load())
+}
+
+// WaitArbitrate returns the start time and size of the last memory allocation attempt.
+func (t *Tracker) WaitArbitrate() (ts time.Time, size int64) {
+	if t == nil {
+		return
+	}
+	m := t.MemArbitrator
+	if m == nil {
+		return
+	}
+	return time.Unix(0, m.AwaitAlloc.StartUtime), m.AwaitAlloc.Size
+}
+
+func (m *memArbitrator) growBigBudget() {
+	duration := int64(0)
+	{
+		upper := m.bigBudget()
+		upper.Lock()
+
+		if k := m.killer; k != nil && k.GetKillSignal() != 0 {
+			upper.Unlock()
+			return
+		}
+
+		used, growThreshold, capacity := m.bigBudgetUsed(), m.bigBudgetGrowThreshold(), m.bigBudgetCap()
+		if used > growThreshold {
+			// expect next cap := used * 2.718
+			extra := max(((used*2783)>>10)-capacity, upper.Pool.allocAlignSize)
+			extra = min(extra, m.poolAllocStats.MaxPoolAllocUnit)
+			extra = max(extra, used*1115/1000-capacity)
+			m.AwaitAlloc.StartUtime = time.Now().UnixNano()
+			m.AwaitAlloc.Size = extra
+			if err := upper.Pool.allocate(extra); err == nil {
+				capacity += extra
+				m.doSetBigBudgetCap(capacity)
+				m.setBigBudgetGrowThreshold(max(capacity*90/100, used))
+			}
+			duration = time.Now().UnixNano() - m.AwaitAlloc.StartUtime
+			m.AwaitAlloc.StartUtime = 0
+			m.AwaitAlloc.Size = 0
+		}
+
+		upper.Unlock()
+	}
+
+	if duration > 0 {
+		m.AwaitAlloc.TotalDur.Add(duration)
+		metrics.GlobalMemArbitrationDuration.Observe(time.Duration(duration).Seconds())
+	}
+}
+
+func (m *memArbitrator) intoBigBudget() bool {
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	if m.state.Load() == memArbitratorStateDown {
+		return false
+	}
+
+	if m.useBigBudget() {
+		return false
+	}
+
+	_, root, err := m.EmplaceRootPool(m.uid)
+
+	if err != nil {
+		panic(err)
+	}
+
+	smallUsed := max(0, m.smallBudgetUsed())
+
+	if !m.RestartEntryByContext(root, &m.ctx) {
+		panic("failed to init mem pool")
+	}
+
+	m.state.Store(memArbitratorStateIntoBigBudget)
+
+	if maxMemHint := max(m.preMaxMem, smallUsed); maxMemHint > m.poolAllocStats.SmallPoolLimit {
+		m.tryToUpdateBuffer(maxMemHint, m.approxUnixTimeSec())
+	}
+
+	{
+		globalArbitrator.metrics.pools.small.Add(-1)
+		globalArbitrator.metrics.pools.intoBig.Add(1)
+	}
+
+	if intest.InTest {
+		if mockDebugInject != nil {
+			mockDebugInject()
+		}
+	}
+
+	m.addBigBudgetUsed(smallUsed)
+
+	m.bigBudget().Pool = root.pool
+
+	if m.reserveSize > 0 {
+		m.reserveBigBudget(m.reserveSize)
+		metrics.GlobalMemArbitratorSubEvents.PoolInitReserve.Inc()
+	} else if m.preMaxMem > 0 {
+		metrics.GlobalMemArbitratorSubEvents.PoolInitHitDigest.Inc()
+		m.reserveBigBudget(m.preMaxMem)
+	} else if m.bigBudgetUsed() > m.poolAllocStats.SmallPoolLimit {
+		if initCap := m.SuggestPoolInitCap(); initCap > 0 {
+			m.reserveBigBudget(initCap)
+			metrics.GlobalMemArbitratorSubEvents.PoolInitMediumQuota.Inc()
+		}
+	}
+
+	if m.bigBudgetCap() == 0 {
+		metrics.GlobalMemArbitratorSubEvents.PoolInitNone.Inc()
+	}
+
+	if m.bigBudgetUsed() > m.bigBudgetGrowThreshold() {
+		m.growBigBudget()
+	}
+
+	m.addBigBudgetUsed(m.cleanSmallBudget() - smallUsed)
+	m.budget.useBig.Store(true)
+	{
+		m.state.Store(memArbitratorStateBigBudget)
+		globalArbitrator.metrics.pools.intoBig.Add(-1)
+		globalArbitrator.metrics.pools.big.Add(1)
+	}
+	return true
+}
+
+func (m *memArbitrator) reserveBigBudget(newCap int64) {
+	duration := int64(0)
+	{
+		upper := m.bigBudget()
+		upper.Lock()
+
+		if k := m.killer; k != nil && k.GetKillSignal() != 0 {
+			upper.Unlock()
+			return
+		}
+
+		capacity := m.bigBudgetCap()
+		used := m.bigBudgetUsed()
+		extra := max(newCap*1115/1000, capacity, used*1115/1000) - capacity
+		m.AwaitAlloc.StartUtime = time.Now().UnixNano()
+		m.AwaitAlloc.Size = extra
+		if err := upper.Pool.allocate(extra); err == nil {
+			capacity += extra
+			m.doSetBigBudgetCap(capacity)
+			m.setBigBudgetGrowThreshold(max(capacity*90/100, used))
+		}
+		duration = time.Now().UnixNano() - m.AwaitAlloc.StartUtime
+		m.AwaitAlloc.StartUtime = 0
+		m.AwaitAlloc.Size = 0
+
+		upper.Unlock()
+	}
+
+	if duration > 0 {
+		m.AwaitAlloc.TotalDur.Add(duration)
+		metrics.GlobalMemArbitrationDuration.Observe(time.Duration(duration).Seconds())
+	}
+}
+
+// DetachMemArbitrator detaches the mem arbitrator from the tracker and cleans up related resources.
+func (t *Tracker) DetachMemArbitrator(exception bool) bool {
+	if t == nil {
+		return false
+	}
+	m := t.MemArbitrator
+	if m == nil {
+		return false
+	}
+	return m.reset(exception, t.MaxConsumed())
+}
+
+func (m *memArbitrator) reset(exception bool, maxConsumed int64) bool {
+	if m.state.Load() == memArbitratorStateDown {
+		return false
+	}
+
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	switch oriState := m.state.Swap(memArbitratorStateDown); oriState {
+	case memArbitratorStateSmallBudget:
+		globalArbitrator.metrics.pools.small.Add(-1)
+	case memArbitratorStateIntoBigBudget:
+		globalArbitrator.metrics.pools.intoBig.Add(-1)
+	case memArbitratorStateBigBudget:
+		globalArbitrator.metrics.pools.big.Add(-1)
+	default:
+		return false
+	}
+
+	m.cleanSmallBudget()
+
+	if m.isInternal {
+		globalArbitrator.metrics.pools.internal.Add(-1)
+	}
+
+	if !exception && maxConsumed > m.poolAllocStats.SmallPoolLimit {
+		m.UpdateDigestProfileCache(m.digestID, maxConsumed, m.approxUnixTimeSec())
+	}
+
+	if m.useBigBudget() {
+		m.bigBudget().Stop()
+		m.ResetRootPoolByID(m.uid, maxConsumed, !exception)
+	}
+	return true
+}
+
+// InitMemArbitratorForTest is a simplified version of InitMemArbitrator for test usage.
+func (t *Tracker) InitMemArbitratorForTest() bool {
+	return t.InitMemArbitrator(GlobalMemArbitrator(), nil, InvalidDigestID, ArbitrationPriorityMedium, false, 0, false)
+}
+
+// InitMemArbitrator attaches (not thread-safe) to the mem arbitrator and initializes the context
+// "m" is the mem-arbitrator.
+// "killer" is the sql killer.
+// "digestID" identifies the digest profile. InvalidDigestID disables the profile cache.
+// "memPriority" is the memory priority for arbitration.
+// "waitAverse" represents the wait averse property.
+// "explicitReserveSize" is the explicit mem quota size to be reserved.
+// "isInternal" indicates whether the tracker is for internal session.
+func (t *Tracker) InitMemArbitrator(
+	g *MemArbitrator,
+	killer *sqlkiller.SQLKiller,
+	digestID uint64,
+	memPriority ArbitrationPriority,
+	waitAverse bool,
+	explicitReserveSize int64,
+	isInternal bool,
+) bool {
+	if g == nil || t == nil {
+		return false
+	}
+	if t.MemArbitrator != nil {
+		t.MemArbitrator.reset(true, 0)
+		t.MemArbitrator = nil
+	}
+	uid := t.SessionID.Load()
+	m := &memArbitrator{
+		MemArbitrator: g,
+		uid:           uid,
+		killer:        killer,
+		digestID:      digestID,
+		reserveSize:   explicitReserveSize,
+		isInternal:    isInternal,
+	}
+	m.ctx = ArbitrationContext{
+		arbitrateHelper: m,
+		memPriority:     memPriority,
+		waitAverse:      waitAverse,
+		preferPrivilege: true,
+	}
+
+	if explicitReserveSize == 0 && digestID != InvalidDigestID {
+		if maxMem, found := g.GetDigestProfileCache(digestID, g.approxUnixTimeSec()); found {
+			m.preMaxMem = maxMem
+		}
+	}
+
+	globalArbitrator.metrics.pools.small.Add(1)
+	if m.isInternal {
+		globalArbitrator.metrics.pools.internal.Add(1)
+	}
+
+	if explicitReserveSize > 0 || m.preMaxMem > g.poolAllocStats.SmallPoolLimit {
+		m.intoBigBudget()
+	} else {
+		m.budget.smallB = g.GetAwaitFreeBudgets(uid)
+		m.budget.smallLimit = g.poolAllocStats.SmallPoolLimit
+	}
+
+	t.MemArbitrator = m
+	return true
+}
+
+func (m *memArbitrator) Done() <-chan struct{} {
+	if m == nil {
+		return nil
+	}
+	if k := m.killer; k != nil {
+		return k.GetKillEventChan()
+	}
+	return nil
+}
+
+func (m *memArbitrator) Stop(reason ArbitratorStopReason) bool {
+	if m == nil {
+		return false
+	}
+	if k := m.killer; k != nil {
+		k.SendKillSignalWithKillEventReason(sqlkiller.KilledByMemArbitrator, reason.String())
+	}
+	return true
+}
+
+func (m *memArbitrator) MemUsage() (res MemUsage) {
+	if m == nil {
+		return
+	}
+	if m.useBigBudget() {
+		return MemUsage{
+			RootPoolUsed: max(0, m.bigBudgetUsed()-m.budget.reversal.Load()),
+			HeapInuse:    max(0, m.bigBudgetUsed()),
+		}
+	}
+	return MemUsage{
+		HeapInuse: max(0, m.smallBudgetUsed(), m.bigBudgetUsed()),
+	}
 }

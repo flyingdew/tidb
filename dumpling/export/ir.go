@@ -3,13 +3,13 @@
 package export
 
 import (
-	"bytes"
 	"database/sql"
 	"strings"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/br/pkg/version"
 	tcontext "github.com/pingcap/tidb/dumpling/context"
+	"github.com/pingcap/tidb/pkg/dumpformat/parquetfile"
 )
 
 // TableDataIR is table data intermediate representation.
@@ -35,7 +35,11 @@ type TableMeta interface {
 	ShowCreateView() string
 	AvgRowLength() uint64
 	HasImplicitRowID() bool
+	ColumnInfos() []*ColumnInfo
 }
+
+// ColumnInfo is an alias of parquet column metadata used by dumpling.
+type ColumnInfo = parquetfile.ColumnInfo
 
 // SQLRowIter is the iterator on a collection of sql.Row.
 type SQLRowIter interface {
@@ -47,24 +51,12 @@ type SQLRowIter interface {
 	Close() error
 }
 
-// RowReceiverStringer is a combined interface of RowReceiver and Stringer
-type RowReceiverStringer interface {
-	RowReceiver
-	Stringer
-}
-
-// Stringer is an interface which represents sql types that support writing to buffer in sql/csv type
-type Stringer interface {
-	WriteToBuffer(*bytes.Buffer, bool)
-	WriteToBufferInCsv(*bytes.Buffer, bool, *csvOption)
-}
-
-// RowReceiver is an interface which represents sql types that support bind address for *sql.Rows
+// RowReceiver is a decode target that binds its columns to *sql.Rows.Scan.
 type RowReceiver interface {
-	BindAddress([]interface{})
+	BindAddress([]any)
 }
 
-func decodeFromRows(rows *sql.Rows, args []interface{}, row RowReceiver) error {
+func decodeFromRows(rows *sql.Rows, args []any, row RowReceiver) error {
 	row.BindAddress(args)
 	if err := rows.Scan(args...); err != nil {
 		rows.Close()
@@ -99,9 +91,9 @@ func setTableMetaFromRows(serverType version.ServerType, rows *sql.Rows) (TableM
 		nms[i] = wrapBackTicks(nms[i])
 	}
 	return &tableMeta{
-		colTypes:      tps,
-		selectedField: strings.Join(nms, ","),
-		selectedLen:   len(nms),
-		specCmts:      getSpecialComments(serverType),
+		colTypes:       tps,
+		sourceColTypes: tps,
+		selectedField:  strings.Join(nms, ","),
+		specCmts:       getSpecialComments(serverType),
 	}, nil
 }

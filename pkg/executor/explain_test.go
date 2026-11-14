@@ -52,11 +52,15 @@ func TestExplainAnalyzeMemory(t *testing.T) {
 	checkMemoryInfo(t, tk, "explain analyze select k from t use index(k)")
 	checkMemoryInfo(t, tk, "explain analyze select * from t use index(k)")
 	checkMemoryInfo(t, tk, "explain analyze select v+k from t")
+	for _, pipelined := range []string{"0", "1"} {
+		tk.MustExec("set @@tidb_enable_pipelined_window_function=" + pipelined)
+		checkMemoryInfo(t, tk, "explain analyze select sum(v) over () from t")
+	}
 }
 
 func checkMemoryInfo(t *testing.T, tk *testkit.TestKit, sql string) {
-	memCol := 6
-	ops := []string{"Join", "Reader", "Top", "Sort", "LookUp", "Projection", "Selection", "Agg"}
+	memCol := 7
+	ops := []string{"Join", "Reader", "Top", "Sort", "LookUp", "Projection", "Selection", "Agg", "Window"}
 	rows := tk.MustQuery(sql).Rows()
 	for _, row := range rows {
 		strs := make([]string, len(row))
@@ -77,6 +81,9 @@ func checkMemoryInfo(t *testing.T, tk *testkit.TestKit, sql string) {
 
 		if shouldHasMem {
 			require.NotEqual(t, "N/A", strs[memCol])
+			if strings.Contains(strs[0], "Window") {
+				require.NotEqual(t, "0 Bytes", strs[memCol])
+			}
 		} else {
 			require.Equal(t, "N/A", strs[memCol])
 		}
@@ -114,6 +121,13 @@ func TestMemoryAndDiskUsageAfterClose(t *testing.T) {
 	}
 	for _, sql := range SQLs {
 		tk.MustQuery(sql)
+		require.Equal(t, int64(0), tk.Session().GetSessionVars().StmtCtx.MemTracker.BytesConsumed())
+		require.Greater(t, tk.Session().GetSessionVars().StmtCtx.MemTracker.MaxConsumed(), int64(0))
+		require.Equal(t, int64(0), tk.Session().GetSessionVars().StmtCtx.DiskTracker.BytesConsumed())
+	}
+	for _, pipelined := range []string{"0", "1"} {
+		tk.MustExec("set @@tidb_enable_pipelined_window_function=" + pipelined)
+		tk.MustQuery("select rank() over (order by v) from t")
 		require.Equal(t, int64(0), tk.Session().GetSessionVars().StmtCtx.MemTracker.BytesConsumed())
 		require.Greater(t, tk.Session().GetSessionVars().StmtCtx.MemTracker.MaxConsumed(), int64(0))
 		require.Equal(t, int64(0), tk.Session().GetSessionVars().StmtCtx.DiskTracker.BytesConsumed())
@@ -186,6 +200,64 @@ func checkActRows(t *testing.T, tk *testkit.TestKit, sql string, expected []stri
 	}
 }
 
+func checkAnalyzeRUFormat(t *testing.T, tk *testkit.TestKit, sql string, expectedActRows []string) {
+	t.Helper()
+	rows := tk.MustQuery("explain analyze format = 'ru' " + sql).Rows()
+	require.Equal(t, len(expectedActRows), len(rows))
+	for id, row := range rows {
+		require.Len(t, row, 7)
+		require.NotEmpty(t, row[0])
+		require.NotEmpty(t, row[1])
+		require.Equal(t, expectedActRows[id], row[2], fmt.Sprintf("error comparing %s", sql))
+		require.NotEmpty(t, row[3])
+		require.NotEmpty(t, row[4])
+		require.NotEmpty(t, row[5])
+		require.Equal(t, "", row[6])
+	}
+}
+
+func TestExplainAnalyzeRUFormatIgnoresLiteralLength(t *testing.T) {
+	defer config.RestoreFunc()()
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.EnableCollectExecutionInfo = true
+	})
+
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t_ru_literal_length")
+	tk.MustExec("create table t_ru_literal_length(a varchar(20))")
+	tk.MustExec("insert into t_ru_literal_length values ('x')")
+
+	explainAnalyzeRUTotal := func(sql string) float64 {
+		t.Helper()
+		rows := tk.MustQuery("explain analyze format = 'ru' " + sql).Rows()
+		require.NotEmpty(t, rows)
+
+		const (
+			cumRUCol    = 4
+			cumRUPctCol = 5
+		)
+		var totalRU *float64
+		for _, row := range rows {
+			require.Len(t, row, 7)
+			if row[cumRUPctCol] != "100.00%" {
+				continue
+			}
+			ru, err := strconv.ParseFloat(row[cumRUCol].(string), 64)
+			require.NoError(t, err)
+			require.Nil(t, totalRU)
+			totalRU = &ru
+		}
+		require.NotNil(t, totalRU)
+		return *totalRU
+	}
+
+	shortRU := explainAnalyzeRUTotal("select * from t_ru_literal_length where a = 'aaa'")
+	longRU := explainAnalyzeRUTotal("select * from t_ru_literal_length where a = 'aaaaaaaaaa'")
+	require.Equal(t, shortRU, longRU)
+}
+
 func TestCheckActRowsWithUnistore(t *testing.T) {
 	defer config.RestoreFunc()()
 	config.UpdateGlobal(func(conf *config.Config) {
@@ -195,7 +267,7 @@ func TestCheckActRowsWithUnistore(t *testing.T) {
 	// testSuite1 use default mockstore which is unistore
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
-	tk.MustExec("set tidb_cost_model_version=2")
+
 	tk.MustExec("drop table if exists t_unistore_act_rows")
 	tk.MustExec("create table t_unistore_act_rows(a int, b int, index(a, b))")
 	tk.MustExec("insert into t_unistore_act_rows values (1, 0), (1, 0), (2, 0), (2, 1)")
@@ -260,6 +332,9 @@ func TestCheckActRowsWithUnistore(t *testing.T) {
 	for _, test := range tests {
 		checkActRows(t, tk, test.sql, test.expected)
 	}
+
+	checkAnalyzeRUFormat(t, tk, "select * from t_unistore_act_rows", []string{"4", "4"})
+	checkAnalyzeRUFormat(t, tk, "select * from t_unistore_act_rows where b > 0", []string{"1", "1", "4"})
 }
 
 func TestExplainAnalyzeCTEMemoryAndDiskInfo(t *testing.T) {
@@ -322,7 +397,8 @@ func TestIssue35911(t *testing.T) {
 	timeStr1 := extractTime.FindStringSubmatch(rows[4][5].(string))[1]
 	time1, err := time.ParseDuration(timeStr1)
 	require.NoError(t, err)
-	timeStr2 := extractTime.FindStringSubmatch(rows[5][5].(string))[1]
+	extractTime2, _ := regexp.Compile("^total_time:(.*?),")
+	timeStr2 := extractTime2.FindStringSubmatch(rows[5][5].(string))[1]
 	time2, err := time.ParseDuration(timeStr2)
 	require.NoError(t, err)
 	// The duration of IndexLookUp should be longer than its build side child
@@ -339,6 +415,48 @@ func TestIssue35911(t *testing.T) {
 	require.NoError(t, err)
 	// To be consistent with other operators, we should not aggregate the concurrency in the runtime stats.
 	require.EqualValues(t, 5, concurrency)
+}
+
+func TestTotalTimeCases(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t1 (c1 bigint, c2 int, c3 int, c4 int, primary key(c1, c2), index (c3));")
+	lineNum := 1000
+	for i := range lineNum {
+		tk.MustExec(fmt.Sprintf("insert into t1 values(%d, %d, %d, %d);", i, i+1, i+2, i+3))
+	}
+	tk.MustExec("analyze table t1")
+	tk.MustExec("set @@tidb_executor_concurrency = 5;")
+
+	tk.MustExec("set @@tidb_enable_parallel_apply = 0;")
+	rows := tk.MustQuery("explain analyze select (select /*+ NO_DECORRELATE() */ sum(c4) from t1 where t1.c3 = alias.c3) from t1 alias where alias.c1 = 1;").Rows()
+	require.True(t, len(rows) == 11)
+
+	// Line3 is tikv_task, others should be all walltime
+	for i := range 11 {
+		if i != 3 {
+			require.True(t, strings.HasPrefix(rows[i][5].(string), "time:"))
+		}
+	}
+
+	// use parallel_apply
+	tk.MustExec("set @@tidb_enable_parallel_apply = 1;")
+	rows = tk.MustQuery("explain analyze select (select /*+ NO_DECORRELATE() */ sum(c4) from t1 where t1.c3 = alias.c3) from t1 alias where alias.c1 = 1;").Rows()
+	require.True(t, len(rows) == 11)
+	// Line0-2 is walltime, Line3 is tikv_task, Line9 Line10 are special, they are total time in integration environment, while
+	// walltime in uts due to only one IndexLookUp executor is actually open, others should be all total_time.
+	for i := range 11 {
+		if i == 9 || i == 10 {
+			continue
+		}
+		if i < 3 {
+			require.True(t, strings.HasPrefix(rows[i][5].(string), "time:"))
+		} else if i > 3 {
+			require.True(t, strings.HasPrefix(rows[i][5].(string), "total_time:"))
+		}
+	}
 }
 
 func flatJSONPlan(j *plannercore.ExplainInfoForEncode) (res []*plannercore.ExplainInfoForEncode) {
@@ -453,6 +571,7 @@ func TestExplainFormatInCtx(t *testing.T) {
 		types.ExplainFormatTiDBJSON,
 		types.ExplainFormatCostTrace,
 		types.ExplainFormatPlanCache,
+		types.ExplainFormatRU,
 	}
 
 	tk.MustExec("select * from t")
@@ -470,4 +589,40 @@ func TestExplainFormatInCtx(t *testing.T) {
 			tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("1"))
 		}
 	}
+}
+
+func TestExplainImportFromSelect(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int primary key)")
+	tk.MustExec("create table t_o (a int primary key)")
+	tk.MustExec("insert into t values (2)")
+	rs := tk.MustQuery("explain import into t_o from select * from t").Rows()
+	require.Contains(t, rs[0][0], "ImportInto")
+	require.Contains(t, rs[1][0], "TableReader")
+	require.Contains(t, rs[2][0], "TableFullScan")
+}
+
+func TestExplainFormatPlanTree(t *testing.T) {
+	store, _ := testkit.CreateMockStoreAndDomain(t)
+	testKit := testkit.NewTestKit(t, store)
+
+	testKit.MustExec("use test")
+	testKit.MustExec("drop table if exists t")
+	testKit.MustExec("create table t(a int, b int, index idx(a))")
+
+	// Test the new plan_tree format
+	rows := testKit.MustQuery("explain format='plan_tree' select * from t where a = 5").Rows()
+
+	// Test that each row has exactly 4 columns
+	for i, row := range rows {
+		require.Equal(t, 4, len(row), "Row %d should have 4 columns", i)
+	}
+
+	// Test that explain analyze format='plan_tree' fails with an error message
+	err := testKit.ExecToErr("explain analyze format='plan_tree' select * from t")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "plan_tree")
 }

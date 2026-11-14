@@ -16,9 +16,10 @@ import (
 	"github.com/pingcap/tidb/br/pkg/glue"
 	"github.com/pingcap/tidb/br/pkg/metautil"
 	"github.com/pingcap/tidb/br/pkg/rtree"
-	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/summary"
 	"github.com/pingcap/tidb/br/pkg/utils"
+	"github.com/pingcap/tidb/pkg/objstore"
+	"github.com/pingcap/tidb/pkg/objstore/storeapi"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
@@ -48,6 +49,7 @@ func DefineRawBackupFlags(command *cobra.Command) {
 	command.Flags().StringP(flagTiKVColumnFamily, "", "default", "backup specify cf, correspond to tikv cf")
 	command.Flags().StringP(flagStartKey, "", "", "backup raw kv start key, key is inclusive")
 	command.Flags().StringP(flagEndKey, "", "", "backup raw kv end key, key is exclusive")
+	command.Flags().String(flagKeyspaceName, "", "keyspace name for backup")
 	command.Flags().String(flagCompressionType, "zstd",
 		"backup sst file compression algorithm, value can be one of 'lz4|zstd|snappy'")
 	command.Flags().Bool(flagRemoveSchedulers, false,
@@ -98,6 +100,10 @@ func (cfg *RawKvConfig) ParseBackupConfigFromFlags(flags *pflag.FlagSet) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
+	cfg.KeyspaceName, err = flags.GetString(flagKeyspaceName)
+	if err != nil {
+		return errors.Trace(err)
+	}
 
 	compressionCfg, err := parseCompressionFlags(flags)
 	if err != nil {
@@ -132,20 +138,20 @@ func RunBackupRaw(c context.Context, g glue.Glue, cmdName string, cfg *RawKvConf
 		ctx = opentracing.ContextWithSpan(ctx, span1)
 	}
 
-	u, err := storage.ParseBackend(cfg.Storage, &cfg.BackendOptions)
+	u, err := objstore.ParseBackend(cfg.Storage, &cfg.BackendOptions)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	// Backup raw does not need domain.
 	needDomain := false
-	mgr, err := NewMgr(ctx, g, cfg.PD, cfg.TLS, GetKeepalive(&cfg.Config), cfg.CheckRequirements, needDomain, conn.NormalVersionChecker)
+	mgr, err := NewMgr(ctx, g, cfg.KeyspaceName, cfg.PD, cfg.TLS, GetKeepalive(&cfg.Config), cfg.CheckRequirements, needDomain, conn.NormalVersionChecker)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	defer mgr.Close()
 
 	client := backup.NewBackupClient(ctx, mgr)
-	opts := storage.ExternalStorageOptions{
+	opts := storeapi.Options{
 		NoCredentials:            cfg.NoCreds,
 		SendCredentials:          cfg.SendCreds,
 		CheckS3ObjectLockOptions: true,
@@ -154,7 +160,7 @@ func RunBackupRaw(c context.Context, g glue.Glue, cmdName string, cfg *RawKvConf
 		return errors.Trace(err)
 	}
 
-	backupRange := rtree.Range{StartKey: cfg.StartKey, EndKey: cfg.EndKey}
+	backupRange := rtree.KeyRange{StartKey: cfg.StartKey, EndKey: cfg.EndKey}
 
 	if cfg.RemoveSchedulers {
 		restore, e := mgr.RemoveSchedulers(ctx)
@@ -168,7 +174,7 @@ func RunBackupRaw(c context.Context, g glue.Glue, cmdName string, cfg *RawKvConf
 			}
 		}()
 		if e != nil {
-			return errors.Trace(err)
+			return errors.Trace(e)
 		}
 	}
 
@@ -192,7 +198,7 @@ func RunBackupRaw(c context.Context, g glue.Glue, cmdName string, cfg *RawKvConf
 		ctx, cmdName, int64(approximateRegions), !cfg.LogProgress)
 
 	progressCallBack := func(unit backup.ProgressUnit) {
-		if unit == backup.RangeUnit {
+		if unit == backup.UnitRange {
 			return
 		}
 		updateCh.Inc()
@@ -213,18 +219,13 @@ func RunBackupRaw(c context.Context, g glue.Glue, cmdName string, cfg *RawKvConf
 		CompressionLevel: cfg.CompressionLevel,
 		CipherInfo:       &cfg.CipherInfo,
 	}
-	rg := rtree.Range{
+	rg := rtree.KeyRange{
 		StartKey: backupRange.StartKey,
 		EndKey:   backupRange.EndKey,
 	}
-	progressRange := &rtree.ProgressRange{
-		Res:        rtree.NewRangeTree(),
-		Incomplete: []rtree.Range{rg},
-		Origin:     rg,
-	}
 	metaWriter := metautil.NewMetaWriter(client.GetStorage(), metautil.MetaFileSize, false, metautil.MetaFile, &cfg.CipherInfo)
 	metaWriter.StartWriteMetasAsync(ctx, metautil.AppendDataFile)
-	err = client.BackupRange(ctx, req, map[string]string{}, progressRange, metaWriter, progressCallBack)
+	_, err = client.BackupRanges(ctx, []rtree.KeyRange{rg}, req, 1, backup.RangesSentThreshold, nil, metaWriter, progressCallBack, nil)
 	if err != nil {
 		return errors.Trace(err)
 	}

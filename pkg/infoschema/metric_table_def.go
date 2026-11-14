@@ -29,7 +29,7 @@ var MetricTableMap = map[string]MetricTableDef{
 		Comment: "TiDB query processing numbers per second",
 	},
 	"tidb_qps_ideal": {
-		PromQL: `sum(tidb_server_connections) * sum(rate(tidb_server_handle_query_duration_seconds_count[$RANGE_DURATION])) / sum(rate(tidb_server_handle_query_duration_seconds_sum[$RANGE_DURATION]))`,
+		PromQL: `sum(tidb_server_connections) * sum(rate(tidb_server_handle_command_duration_seconds_count[$RANGE_DURATION])) / sum(rate(tidb_server_handle_command_duration_seconds_sum[$RANGE_DURATION]))`,
 	},
 	"tidb_ops_statement": {
 		PromQL:  `sum(rate(tidb_executor_statement_total{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (instance,type)`,
@@ -46,6 +46,11 @@ var MetricTableMap = map[string]MetricTableDef{
 		Labels:   []string{"instance"},
 		Quantile: 0.90,
 		Comment:  "The quantile of TiDB slow query statistics with slow query time(second)",
+	},
+	"tidb_slow_query_qps": {
+		PromQL:  "sum(rate(tidb_server_slow_query_total{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (instance,sql_type)",
+		Labels:  []string{"instance", "sql_type"},
+		Comment: "TiDB slow query processing numbers per second",
 	},
 	"tidb_slow_query_cop_process_duration": {
 		PromQL:   "histogram_quantile($QUANTILE, sum(rate(tidb_server_slow_query_cop_duration_seconds_bucket{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (le,instance))",
@@ -299,7 +304,7 @@ var MetricTableMap = map[string]MetricTableDef{
 		Comment:  "The quantile of distsql partial numbers per query",
 	},
 	"tidb_cop_duration": {
-		PromQL:   "histogram_quantile($QUANTILE, sum(rate(tidb_tikvclient_cop_duration_seconds_bucket{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (le, instance))",
+		PromQL:   "histogram_quantile($QUANTILE, sum(rate(tidb_tikvclient_request_seconds_bucket{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (le,instance))",
 		Labels:   []string{"instance"},
 		Quantile: 0.95,
 		Comment:  "The quantile of kv storage coprocessor processing durations",
@@ -534,6 +539,11 @@ var MetricTableMap = map[string]MetricTableDef{
 	"tidb_statistics_auto_analyze_ops": {
 		Comment: "TiDB auto analyze query per second",
 		PromQL:  "sum(rate(tidb_statistics_auto_analyze_total{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (type,instance)",
+		Labels:  []string{"instance", "type"},
+	},
+	"tidb_statistics_manual_analyze_ops": {
+		Comment: "TiDB manual analyze query per second",
+		PromQL:  "sum(rate(tidb_statistics_manual_analyze_total{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (type,instance)",
 		Labels:  []string{"instance", "type"},
 	},
 	"tidb_statistics_stats_inaccuracy_rate": {
@@ -878,6 +888,21 @@ var MetricTableMap = map[string]MetricTableDef{
 		PromQL:  `sum(tikv_engine_size_bytes{$LABEL_CONDITIONS}) by (instance, type, db)`,
 		Labels:  []string{"instance", "type", "db"},
 		Comment: "The storage size per TiKV instance",
+	},
+	"tidb_ia_remote_read_segment_count": {
+		PromQL:  `sum(increase(tidb_server_ia_remote_read_segment_count{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (instance)`,
+		Labels:  []string{"instance"},
+		Comment: "The total count of IA remote read segments observed by each TiDB instance",
+	},
+	"tidb_ia_remote_read_segment_size": {
+		PromQL:  `sum(increase(tidb_server_ia_remote_read_segment_size_bytes{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (instance)`,
+		Labels:  []string{"instance"},
+		Comment: "The total bytes of IA remote read segments observed by each TiDB instance",
+	},
+	"tidb_ia_remote_read_segment_wait_time_histogram": {
+		PromQL:  `sum(rate(tidb_server_ia_remote_read_segment_wait_duration_seconds_bucket{$LABEL_CONDITIONS}[$RANGE_DURATION])) by (instance,le)`,
+		Labels:  []string{"instance", "le"},
+		Comment: "The histogram of IA remote read segment wait time observed by each TiDB instance",
 	},
 	"tikv_store_size": {
 		PromQL:  `sum(tikv_store_size_bytes{$LABEL_CONDITIONS}) by (instance,type)`,

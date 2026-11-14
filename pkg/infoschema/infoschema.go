@@ -16,59 +16,38 @@ package infoschema
 
 import (
 	"cmp"
+	stdctx "context"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/ngaut/pools"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/ddl/placement"
+	"github.com/pingcap/tidb/pkg/infoschema/context"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/autoid"
-	"github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/meta/metadef"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/parser/terror"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/util"
+	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/intest"
+	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/mock"
+	"github.com/pingcap/tidb/pkg/util/sqlexec"
+	"go.uber.org/zap"
 )
 
-// InfoSchema is the interface used to retrieve the schema information.
-// It works as a in memory cache and doesn't handle any schema change.
-// InfoSchema is read-only, and the returned value is a copy.
-// TODO: add more methods to retrieve tables and columns.
-type InfoSchema interface {
-	SchemaByName(schema model.CIStr) (*model.DBInfo, bool)
-	SchemaExists(schema model.CIStr) bool
-	TableByName(schema, table model.CIStr) (table.Table, error)
-	TableExists(schema, table model.CIStr) bool
-	SchemaByID(id int64) (*model.DBInfo, bool)
-	SchemaByTable(tableInfo *model.TableInfo) (*model.DBInfo, bool)
-	PolicyByName(name model.CIStr) (*model.PolicyInfo, bool)
-	ResourceGroupByName(name model.CIStr) (*model.ResourceGroupInfo, bool)
-	TableByID(id int64) (table.Table, bool)
-	AllocByID(id int64) (autoid.Allocators, bool)
-	AllSchemaNames() []string
-	AllSchemas() []*model.DBInfo
-	Clone() (result []*model.DBInfo)
-	SchemaTables(schema model.CIStr) []table.Table
-	SchemaMetaVersion() int64
-	// TableIsView indicates whether the schema.table is a view.
-	TableIsView(schema, table model.CIStr) bool
-	// TableIsSequence indicates whether the schema.table is a sequence.
-	TableIsSequence(schema, table model.CIStr) bool
-	FindTableByPartitionID(partitionID int64) (table.Table, *model.DBInfo, *model.PartitionDefinition)
-	// PlacementBundleByPhysicalTableID is used to get a rule bundle.
-	PlacementBundleByPhysicalTableID(id int64) (*placement.Bundle, bool)
-	// AllPlacementBundles is used to get all placement bundles
-	AllPlacementBundles() []*placement.Bundle
-	// AllPlacementPolicies returns all placement policies
-	AllPlacementPolicies() []*model.PolicyInfo
-	// AllResourceGroups returns all resource groups
-	AllResourceGroups() []*model.ResourceGroupInfo
-	// HasTemporaryTable returns whether information schema has temporary table
-	HasTemporaryTable() bool
-	// GetTableReferredForeignKeys gets the table's ReferredFKInfo by lowercase schema and table name.
-	GetTableReferredForeignKeys(schema, table string) []*model.ReferredFKInfo
-}
+var _ context.Misc = &infoSchema{}
 
 type sortedTables []table.Table
 
@@ -90,6 +69,43 @@ type schemaTables struct {
 const bucketCount = 512
 
 type infoSchema struct {
+	infoSchemaMisc
+	schemaMap map[string]*schemaTables
+	// schemaID2Name is a map from schema ID to schema name.
+	// it should be enough to query by name only theoretically, but there are some
+	// places we only have schema ID, and we check both name and id in some sanity checks.
+	schemaID2Name map[int64]string
+
+	// sortedTablesBuckets is a slice of sortedTables, a table's bucket index is (tableID % bucketCount).
+	sortedTablesBuckets []sortedTables
+
+	// referredForeignKeyMap records all table's ReferredFKInfo.
+	// referredSchemaAndTableName => child SchemaAndTableAndForeignKeyName => *model.ReferredFKInfo
+	referredForeignKeyMap map[SchemaAndTableName][]*model.ReferredFKInfo
+	// maskingPolicyTableColumnMap stores masking policy metadata by table and column IDs.
+	// Note: Policy name is only unique per table, not globally. We use [TableID][ColumnID] as key
+	// to avoid name collision when different tables have policies with the same name.
+	maskingPolicyTableColumnMap map[int64]map[int64]*model.MaskingPolicyInfo
+	// maskingPoliciesLoaded indicates whether masking policies have been loaded.
+	maskingPoliciesLoaded bool
+	// maskingPoliciesLoadCh is non-nil when a masking-policy load is in progress.
+	// Waiters block on this channel to avoid serving partially initialized policy maps.
+	maskingPoliciesLoadCh chan struct{}
+	// maskingPolicyMutex protects maskingPolicyTableColumnMap and loading state.
+	maskingPolicyMutex sync.RWMutex
+	// factory is used to execute SQL for delayed loading of masking policies.
+	factory func() (pools.Resource, error)
+	// ts is the timestamp at which this InfoSchema was loaded.
+	// Used for snapshot-aware lazy loading of masking policies.
+	ts uint64
+
+	r autoid.Requirement
+}
+
+type infoSchemaMisc struct {
+	// schemaMetaVersion is the version of schema, and we should check version when change schema.
+	schemaMetaVersion int64
+
 	// ruleBundleMap stores all placement rules
 	ruleBundleMap map[int64]*placement.Bundle
 
@@ -101,20 +117,8 @@ type infoSchema struct {
 	resourceGroupMutex sync.RWMutex
 	resourceGroupMap   map[string]*model.ResourceGroupInfo
 
-	schemaMap map[string]*schemaTables
-
-	// sortedTablesBuckets is a slice of sortedTables, a table's bucket index is (tableID % bucketCount).
-	sortedTablesBuckets []sortedTables
-
 	// temporaryTables stores the temporary table ids
 	temporaryTableIDs map[int64]struct{}
-
-	// schemaMetaVersion is the version of schema, and we should check version when change schema.
-	schemaMetaVersion int64
-
-	// referredForeignKeyMap records all table's ReferredFKInfo.
-	// referredSchemaAndTableName => child SchemaAndTableAndForeignKeyName => *model.ReferredFKInfo
-	referredForeignKeyMap map[SchemaAndTableName][]*model.ReferredFKInfo
 }
 
 // SchemaAndTableName contains the lower-case schema name and table name.
@@ -125,19 +129,57 @@ type SchemaAndTableName struct {
 
 // MockInfoSchema only serves for test.
 func MockInfoSchema(tbList []*model.TableInfo) InfoSchema {
-	result := &infoSchema{}
-	result.schemaMap = make(map[string]*schemaTables)
-	result.policyMap = make(map[string]*model.PolicyInfo)
-	result.resourceGroupMap = make(map[string]*model.ResourceGroupInfo)
-	result.ruleBundleMap = make(map[int64]*placement.Bundle)
-	result.sortedTablesBuckets = make([]sortedTables, bucketCount)
-	dbInfo := &model.DBInfo{ID: 0, Name: model.NewCIStr("test"), Tables: tbList}
+	result := newInfoSchema(nil, nil)
+	dbInfo := &model.DBInfo{ID: 1, Name: ast.NewCIStr("test")}
+	dbInfo.Deprecated.Tables = tbList
 	tableNames := &schemaTables{
 		dbInfo: dbInfo,
 		tables: make(map[string]table.Table),
 	}
-	result.schemaMap["test"] = tableNames
+	result.addSchema(tableNames)
+	var tableIDs map[int64]struct{}
 	for _, tb := range tbList {
+		intest.AssertFunc(func() bool {
+			if tableIDs == nil {
+				tableIDs = make(map[int64]struct{})
+			}
+			_, ok := tableIDs[tb.ID]
+			intest.Assert(!ok)
+			tableIDs[tb.ID] = struct{}{}
+			return true
+		})
+		tb.DBID = dbInfo.ID
+		tbl := table.MockTableFromMeta(tb)
+		tableNames.tables[tb.Name.L] = tbl
+		bucketIdx := tableBucketIdx(tb.ID)
+		result.sortedTablesBuckets[bucketIdx] = append(result.sortedTablesBuckets[bucketIdx], tbl)
+	}
+	// Add a system table.
+	tables := []*model.TableInfo{
+		{
+			// Use a very big ID to avoid conflict with normal tables.
+			ID:   9999,
+			Name: ast.NewCIStr("stats_meta"),
+			Columns: []*model.ColumnInfo{
+				{
+					State:  model.StatePublic,
+					Offset: 0,
+					Name:   ast.NewCIStr("a"),
+					ID:     1,
+				},
+			},
+			State: model.StatePublic,
+		},
+	}
+	mysqlDBInfo := &model.DBInfo{ID: 2, Name: ast.NewCIStr("mysql")}
+	mysqlDBInfo.Deprecated.Tables = tables
+	tableNames = &schemaTables{
+		dbInfo: mysqlDBInfo,
+		tables: make(map[string]table.Table),
+	}
+	result.addSchema(tableNames)
+	for _, tb := range tables {
+		tb.DBID = mysqlDBInfo.ID
 		tbl := table.MockTableFromMeta(tb)
 		tableNames.tables[tb.Name.L] = tbl
 		bucketIdx := tableBucketIdx(tb.ID)
@@ -153,19 +195,16 @@ func MockInfoSchema(tbList []*model.TableInfo) InfoSchema {
 
 // MockInfoSchemaWithSchemaVer only serves for test.
 func MockInfoSchemaWithSchemaVer(tbList []*model.TableInfo, schemaVer int64) InfoSchema {
-	result := &infoSchema{}
-	result.schemaMap = make(map[string]*schemaTables)
-	result.policyMap = make(map[string]*model.PolicyInfo)
-	result.resourceGroupMap = make(map[string]*model.ResourceGroupInfo)
-	result.ruleBundleMap = make(map[int64]*placement.Bundle)
-	result.sortedTablesBuckets = make([]sortedTables, bucketCount)
-	dbInfo := &model.DBInfo{ID: 0, Name: model.NewCIStr("test"), Tables: tbList}
+	result := newInfoSchema(nil, nil)
+	dbInfo := &model.DBInfo{ID: 1, Name: ast.NewCIStr("test")}
+	dbInfo.Deprecated.Tables = tbList
 	tableNames := &schemaTables{
 		dbInfo: dbInfo,
 		tables: make(map[string]table.Table),
 	}
-	result.schemaMap["test"] = tableNames
+	result.addSchema(tableNames)
 	for _, tb := range tbList {
+		tb.DBID = dbInfo.ID
 		tbl := table.MockTableFromMeta(tb)
 		tableNames.tables[tb.Name.L] = tbl
 		bucketIdx := tableBucketIdx(tb.ID)
@@ -182,51 +221,129 @@ func MockInfoSchemaWithSchemaVer(tbList []*model.TableInfo, schemaVer int64) Inf
 
 var _ InfoSchema = (*infoSchema)(nil)
 
-func (is *infoSchema) SchemaByName(schema model.CIStr) (val *model.DBInfo, ok bool) {
-	tableNames, ok := is.schemaMap[schema.L]
+func (is *infoSchema) base() *infoSchema {
+	return is
+}
+
+func newInfoSchema(r autoid.Requirement, factory func() (pools.Resource, error)) *infoSchema {
+	return &infoSchema{
+		infoSchemaMisc: infoSchemaMisc{
+			policyMap:        map[string]*model.PolicyInfo{},
+			resourceGroupMap: map[string]*model.ResourceGroupInfo{},
+			ruleBundleMap:    map[int64]*placement.Bundle{},
+		},
+		schemaMap:                   map[string]*schemaTables{},
+		schemaID2Name:               map[int64]string{},
+		sortedTablesBuckets:         make([]sortedTables, bucketCount),
+		referredForeignKeyMap:       make(map[SchemaAndTableName][]*model.ReferredFKInfo),
+		maskingPolicyTableColumnMap: make(map[int64]map[int64]*model.MaskingPolicyInfo),
+		factory:                     factory,
+		r:                           r,
+	}
+}
+
+func (is *infoSchema) SchemaByName(schema ast.CIStr) (val *model.DBInfo, ok bool) {
+	return is.schemaByName(schema.L)
+}
+
+func (is *infoSchema) schemaByName(name string) (val *model.DBInfo, ok bool) {
+	tableNames, ok := is.schemaMap[name]
 	if !ok {
 		return
 	}
 	return tableNames.dbInfo, true
 }
 
-func (is *infoSchema) SchemaMetaVersion() int64 {
-	return is.schemaMetaVersion
-}
-
-func (is *infoSchema) SchemaExists(schema model.CIStr) bool {
+func (is *infoSchema) SchemaExists(schema ast.CIStr) bool {
 	_, ok := is.schemaMap[schema.L]
 	return ok
 }
 
-func (is *infoSchema) TableByName(schema, table model.CIStr) (t table.Table, err error) {
+func (is *infoSchema) TableByName(ctx stdctx.Context, schema, table ast.CIStr) (t table.Table, err error) {
 	if tbNames, ok := is.schemaMap[schema.L]; ok {
 		if t, ok = tbNames.tables[table.L]; ok {
 			return
 		}
 	}
-	return nil, ErrTableNotExists.GenWithStackByArgs(schema, table)
+	return nil, ErrTableNotExists.FastGenByArgs(schema, table)
 }
 
-func (is *infoSchema) TableIsView(schema, table model.CIStr) bool {
-	if tbNames, ok := is.schemaMap[schema.L]; ok {
-		if t, ok := tbNames.tables[table.L]; ok {
-			return t.Meta().IsView()
+// TableInfosByNames returns existing table metadata without refilling the shared
+// cache. Result order is unspecified; session table overrides take precedence.
+func TableInfosByNames(ctx stdctx.Context, is InfoSchema, schema ast.CIStr, names []ast.CIStr) ([]*model.TableInfo, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	switch v := is.(type) {
+	case *infoschemaV2:
+		if !IsSpecialDB(schema.L) {
+			return v.tableInfosByNames(ctx, schema, names)
 		}
+	case *SessionExtendedInfoSchema:
+		var tables []*model.TableInfo
+		remaining := make([]ast.CIStr, 0, len(names))
+		for _, name := range names {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if tbl, ok := v.sessionTableByName(ctx, schema, name); ok {
+				tables = append(tables, tbl.Meta())
+				continue
+			}
+			remaining = append(remaining, name)
+		}
+		loaded, err := TableInfosByNames(ctx, v.InfoSchema, schema, remaining)
+		if err != nil {
+			return nil, err
+		}
+		return append(tables, loaded...), nil
+	}
+	ctx = WithRefillOption(ctx, false)
+	tables := make([]*model.TableInfo, 0, len(names))
+	for _, name := range names {
+		// TableByName does not check cancellation for InfoSchema v1 or special
+		// databases. Without this check, the loop may keep running after the query
+		// is canceled.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		tbl, err := is.TableByName(ctx, schema, name)
+		if err != nil {
+			if terror.ErrorEqual(err, ErrTableNotExists) {
+				continue
+			}
+			return nil, errors.Trace(err)
+		}
+		tables = append(tables, tbl.Meta())
+	}
+	return tables, nil
+}
+
+// TableInfoByName implements InfoSchema.TableInfoByName
+func (is *infoSchema) TableInfoByName(schema, table ast.CIStr) (*model.TableInfo, error) {
+	tbl, err := is.TableByName(stdctx.Background(), schema, table)
+	return getTableInfo(tbl), err
+}
+
+// TableIsView indicates whether the schema.table is a view.
+func TableIsView(is InfoSchema, schema, table ast.CIStr) bool {
+	tbl, err := is.TableByName(stdctx.Background(), schema, table)
+	if err == nil {
+		return tbl.Meta().IsView()
 	}
 	return false
 }
 
-func (is *infoSchema) TableIsSequence(schema, table model.CIStr) bool {
-	if tbNames, ok := is.schemaMap[schema.L]; ok {
-		if t, ok := tbNames.tables[table.L]; ok {
-			return t.Meta().IsSequence()
-		}
+// TableIsSequence indicates whether the schema.table is a sequence.
+func TableIsSequence(is InfoSchema, schema, table ast.CIStr) bool {
+	tbl, err := is.TableByName(stdctx.Background(), schema, table)
+	if err == nil {
+		return tbl.Meta().IsSequence()
 	}
 	return false
 }
 
-func (is *infoSchema) TableExists(schema, table model.CIStr) bool {
+func (is *infoSchema) TableExists(schema, table ast.CIStr) bool {
 	if tbNames, ok := is.schemaMap[schema.L]; ok {
 		if _, ok = tbNames.tables[table.L]; ok {
 			return true
@@ -245,41 +362,48 @@ func (is *infoSchema) PolicyByID(id int64) (val *model.PolicyInfo, ok bool) {
 	return nil, false
 }
 
-func (is *infoSchema) ResourceGroupByID(id int64) (val *model.ResourceGroupInfo, ok bool) {
-	is.resourceGroupMutex.RLock()
-	defer is.resourceGroupMutex.RUnlock()
-	for _, v := range is.resourceGroupMap {
-		if v.ID == id {
-			return v, true
-		}
-	}
-	return nil, false
-}
-
-func (is *infoSchema) SchemaByID(id int64) (val *model.DBInfo, ok bool) {
-	for _, v := range is.schemaMap {
-		if v.dbInfo.ID == id {
-			return v.dbInfo, true
-		}
-	}
-	return nil, false
-}
-
-func (is *infoSchema) SchemaByTable(tableInfo *model.TableInfo) (val *model.DBInfo, ok bool) {
-	if tableInfo == nil {
-		return nil, false
-	}
-	for _, v := range is.schemaMap {
-		if tbl, ok := v.tables[tableInfo.Name.L]; ok {
-			if tbl.Meta().ID == tableInfo.ID {
-				return v.dbInfo, true
+func (is *infoSchema) MaskingPolicyByID(id int64) (val *model.MaskingPolicyInfo, ok bool) {
+	is.loadMaskingPoliciesIfNeeded()
+	is.maskingPolicyMutex.RLock()
+	defer is.maskingPolicyMutex.RUnlock()
+	for _, colMap := range is.maskingPolicyTableColumnMap {
+		for _, policy := range colMap {
+			if policy.ID == id {
+				return policy, true
 			}
 		}
 	}
 	return nil, false
 }
 
-func (is *infoSchema) TableByID(id int64) (val table.Table, ok bool) {
+func (is *infoSchema) SchemaByID(id int64) (val *model.DBInfo, ok bool) {
+	name, ok := is.schemaID2Name[id]
+	if !ok {
+		return nil, false
+	}
+	return is.schemaByName(name)
+}
+
+// SchemaByTable get a table's schema name
+func SchemaByTable(is InfoSchema, tableInfo *model.TableInfo) (val *model.DBInfo, ok bool) {
+	if tableInfo == nil {
+		return nil, false
+	}
+	if tableInfo.DBID > 0 {
+		return is.SchemaByID(tableInfo.DBID)
+	}
+	tbl, ok := is.TableByID(stdctx.Background(), tableInfo.ID)
+	if !ok {
+		return nil, false
+	}
+	return is.SchemaByID(tbl.Meta().DBID)
+}
+
+func (is *infoSchema) TableByID(_ stdctx.Context, id int64) (val table.Table, ok bool) {
+	if !tableIDIsValid(id) {
+		return nil, false
+	}
+
 	slice := is.sortedTablesBuckets[tableBucketIdx(id)]
 	idx := slice.searchTable(id)
 	if idx == -1 {
@@ -288,17 +412,105 @@ func (is *infoSchema) TableByID(id int64) (val table.Table, ok bool) {
 	return slice[idx], true
 }
 
-func (is *infoSchema) AllocByID(id int64) (autoid.Allocators, bool) {
-	tbl, ok := is.TableByID(id)
+// TableItemByID implements InfoSchema.TableItemByID.
+func (is *infoSchema) TableItemByID(id int64) (TableItem, bool) {
+	tbl, ok := is.TableByID(stdctx.Background(), id)
 	if !ok {
-		return autoid.Allocators{}, false
+		return TableItem{}, false
 	}
-	return tbl.Allocators(nil), true
+	db, ok := is.SchemaByID(tbl.Meta().DBID)
+	if !ok {
+		return TableItem{}, false
+	}
+	return TableItem{DBName: db.Name, TableName: tbl.Meta().Name}, true
 }
 
-func (is *infoSchema) AllSchemaNames() (names []string) {
-	for _, v := range is.schemaMap {
-		names = append(names, v.dbInfo.Name.O)
+// TableInfoByID implements InfoSchema.TableInfoByID
+func (is *infoSchema) TableInfoByID(id int64) (*model.TableInfo, bool) {
+	tbl, ok := is.TableByID(stdctx.Background(), id)
+	return getTableInfo(tbl), ok
+}
+
+// FindTableInfoByPartitionID implements InfoSchema.FindTableInfoByPartitionID
+func (is *infoSchema) FindTableInfoByPartitionID(
+	partitionID int64,
+) (*model.TableInfo, *model.DBInfo, *model.PartitionDefinition) {
+	tbl, db, partDef := is.FindTableByPartitionID(partitionID)
+	return getTableInfo(tbl), db, partDef
+}
+
+// SchemaTableInfos implements MetaOnlyInfoSchema.
+func (is *infoSchema) SchemaTableInfos(ctx stdctx.Context, schema ast.CIStr) ([]*model.TableInfo, error) {
+	schemaTables, ok := is.schemaMap[schema.L]
+	if !ok {
+		return nil, nil
+	}
+	tables := make([]*model.TableInfo, 0, len(schemaTables.tables))
+	for _, tbl := range schemaTables.tables {
+		tables = append(tables, tbl.Meta())
+	}
+	return tables, nil
+}
+
+// iterSchemaTableInfos makes one streaming pass over all table infos in the schema.
+func (is *infoSchema) iterSchemaTableInfos(
+	ctx stdctx.Context,
+	schema ast.CIStr,
+	visit func(*model.TableInfo) error,
+) error {
+	schemaTables, ok := is.schemaMap[schema.L]
+	if !ok {
+		return nil
+	}
+	for _, tbl := range schemaTables.tables {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := visit(tbl.Meta()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SchemaSimpleTableInfos implements MetaOnlyInfoSchema.
+func (is *infoSchema) SchemaSimpleTableInfos(ctx stdctx.Context, schema ast.CIStr) ([]*model.TableNameInfo, error) {
+	schemaTables, ok := is.schemaMap[schema.L]
+	if !ok {
+		return nil, nil
+	}
+	ret := make([]*model.TableNameInfo, 0, len(schemaTables.tables))
+	for _, t := range schemaTables.tables {
+		ret = append(ret, &model.TableNameInfo{
+			ID:   t.Meta().ID,
+			Name: t.Meta().Name,
+		})
+	}
+	return ret, nil
+}
+
+func (is *infoSchema) ListTablesWithSpecialAttribute(filter context.SpecialAttributeFilter) []context.TableInfoResult {
+	ret := make([]context.TableInfoResult, 0, 10)
+	for _, dbName := range is.AllSchemaNames() {
+		res := context.TableInfoResult{DBName: dbName}
+		tblInfos, err := is.SchemaTableInfos(stdctx.Background(), dbName)
+		terror.Log(err)
+		for _, tblInfo := range tblInfos {
+			if !filter(tblInfo) {
+				continue
+			}
+			res.TableInfos = append(res.TableInfos, tblInfo)
+		}
+		ret = append(ret, res)
+	}
+	return ret
+}
+
+// AllSchemaNames returns all the schemas' names.
+func AllSchemaNames(is InfoSchema) (names []string) {
+	schemas := is.AllSchemaNames()
+	for _, v := range schemas {
+		names = append(names, v.O)
 	}
 	return
 }
@@ -310,15 +522,29 @@ func (is *infoSchema) AllSchemas() (schemas []*model.DBInfo) {
 	return
 }
 
-func (is *infoSchema) SchemaTables(schema model.CIStr) (tables []table.Table) {
-	schemaTables, ok := is.schemaMap[schema.L]
-	if !ok {
+func (is *infoSchema) AllSchemaNames() (schemas []ast.CIStr) {
+	rs := make([]ast.CIStr, 0, len(is.schemaMap))
+	for _, v := range is.schemaMap {
+		rs = append(rs, v.dbInfo.Name)
+	}
+	return rs
+}
+
+func (is *infoSchema) TableItemByPartitionID(partitionID int64) (TableItem, bool) {
+	tbl, db, _ := is.FindTableByPartitionID(partitionID)
+	if tbl == nil {
+		return TableItem{}, false
+	}
+	return TableItem{DBName: db.Name, TableName: tbl.Meta().Name}, true
+}
+
+// TableIDByPartitionID implements InfoSchema.TableIDByPartitionID.
+func (is *infoSchema) TableIDByPartitionID(partitionID int64) (tableID int64, ok bool) {
+	tbl, _, _ := is.FindTableByPartitionID(partitionID)
+	if tbl == nil {
 		return
 	}
-	for _, tbl := range schemaTables.tables {
-		tables = append(tables, tbl)
-	}
-	return
+	return tbl.Meta().ID, true
 }
 
 // FindTableByPartitionID finds the partition-table info by the partitionID.
@@ -340,21 +566,30 @@ func (is *infoSchema) FindTableByPartitionID(partitionID int64) (table.Table, *m
 	return nil, nil, nil
 }
 
+// addSchema is used to add a schema to the infoSchema, it will overwrite the old
+// one if it already exists.
+func (is *infoSchema) addSchema(st *schemaTables) {
+	is.schemaMap[st.dbInfo.Name.L] = st
+	is.schemaID2Name[st.dbInfo.ID] = st.dbInfo.Name.L
+}
+
+func (is *infoSchema) delSchema(di *model.DBInfo) {
+	delete(is.schemaMap, di.Name.L)
+	delete(is.schemaID2Name, di.ID)
+}
+
 // HasTemporaryTable returns whether information schema has temporary table
-func (is *infoSchema) HasTemporaryTable() bool {
+func (is *infoSchemaMisc) HasTemporaryTable() bool {
 	return len(is.temporaryTableIDs) != 0
 }
 
-func (is *infoSchema) Clone() (result []*model.DBInfo) {
-	for _, v := range is.schemaMap {
-		result = append(result, v.dbInfo.Clone())
-	}
-	return
+func (is *infoSchemaMisc) SchemaMetaVersion() int64 {
+	return is.schemaMetaVersion
 }
 
 // GetSequenceByName gets the sequence by name.
-func GetSequenceByName(is InfoSchema, schema, sequence model.CIStr) (util.SequenceTable, error) {
-	tbl, err := is.TableByName(schema, sequence)
+func GetSequenceByName(is InfoSchema, schema, sequence ast.CIStr) (util.SequenceTable, error) {
+	tbl, err := is.TableByName(stdctx.Background(), schema, sequence)
 	if err != nil {
 		return nil, err
 	}
@@ -370,6 +605,7 @@ func init() {
 	infoSchemaTables := make([]*model.TableInfo, 0, len(tableNameToColumns))
 	for name, cols := range tableNameToColumns {
 		tableInfo := buildTableMeta(name, cols)
+		tableInfo.DBID = dbID
 		infoSchemaTables = append(infoSchemaTables, tableInfo)
 		var ok bool
 		tableInfo.ID, ok = tableIDMap[tableInfo.Name.O]
@@ -384,16 +620,16 @@ func init() {
 	}
 	infoSchemaDB := &model.DBInfo{
 		ID:      dbID,
-		Name:    util.InformationSchemaName,
+		Name:    metadef.InformationSchemaName,
 		Charset: mysql.DefaultCharset,
 		Collate: mysql.DefaultCollationName,
-		Tables:  infoSchemaTables,
 	}
+	infoSchemaDB.Deprecated.Tables = infoSchemaTables
 	RegisterVirtualTable(infoSchemaDB, createInfoSchemaTable)
-	util.GetSequenceByName = func(is interface{}, schema, sequence model.CIStr) (util.SequenceTable, error) {
+	util.GetSequenceByName = func(is context.MetaOnlyInfoSchema, schema, sequence ast.CIStr) (util.SequenceTable, error) {
 		return GetSequenceByName(is.(InfoSchema), schema, sequence)
 	}
-	mock.MockInfoschema = func(tbList []*model.TableInfo) sessionctx.InfoschemaMetaVersion {
+	mock.MockInfoschema = func(tbList []*model.TableInfo) context.MetaOnlyInfoSchema {
 		return MockInfoSchema(tbList)
 	}
 }
@@ -409,7 +645,7 @@ func HasAutoIncrementColumn(tbInfo *model.TableInfo) (bool, string) {
 }
 
 // PolicyByName is used to find the policy.
-func (is *infoSchema) PolicyByName(name model.CIStr) (*model.PolicyInfo, bool) {
+func (is *infoSchemaMisc) PolicyByName(name ast.CIStr) (*model.PolicyInfo, bool) {
 	is.policyMutex.RLock()
 	defer is.policyMutex.RUnlock()
 	t, r := is.policyMap[name.L]
@@ -417,15 +653,63 @@ func (is *infoSchema) PolicyByName(name model.CIStr) (*model.PolicyInfo, bool) {
 }
 
 // ResourceGroupByName is used to find the resource group.
-func (is *infoSchema) ResourceGroupByName(name model.CIStr) (*model.ResourceGroupInfo, bool) {
+func (is *infoSchemaMisc) ResourceGroupByName(name ast.CIStr) (*model.ResourceGroupInfo, bool) {
 	is.resourceGroupMutex.RLock()
 	defer is.resourceGroupMutex.RUnlock()
 	t, r := is.resourceGroupMap[name.L]
 	return t, r
 }
 
+// MaskingPolicyByName returns masking policy metadata by policy name with delayed loading.
+// Note: Policy name is only unique per table, not globally. This method returns the first matching
+// policy if multiple tables have policies with the same name. For precise lookup, use MaskingPolicyByTableColumn.
+func (is *infoSchema) MaskingPolicyByName(name ast.CIStr) (*model.MaskingPolicyInfo, bool) {
+	is.loadMaskingPoliciesIfNeeded()
+
+	is.maskingPolicyMutex.RLock()
+	defer is.maskingPolicyMutex.RUnlock()
+	var found *model.MaskingPolicyInfo
+	for _, colMap := range is.maskingPolicyTableColumnMap {
+		for _, policy := range colMap {
+			if policy.Name.L == name.L {
+				if found != nil {
+					return nil, false
+				}
+				found = policy
+			}
+		}
+	}
+	return found, found != nil
+}
+
+// MaskingPolicyByTableColumn returns masking policy metadata by table and column IDs with delayed loading.
+func (is *infoSchema) MaskingPolicyByTableColumn(tableID, columnID int64) (*model.MaskingPolicyInfo, bool) {
+	is.loadMaskingPoliciesIfNeeded()
+
+	is.maskingPolicyMutex.RLock()
+	defer is.maskingPolicyMutex.RUnlock()
+	colMap, ok := is.maskingPolicyTableColumnMap[tableID]
+	if !ok {
+		return nil, false
+	}
+	t, r := colMap[columnID]
+	return t, r
+}
+
+// ResourceGroupByID is used to find the resource group.
+func (is *infoSchemaMisc) ResourceGroupByID(id int64) (*model.ResourceGroupInfo, bool) {
+	is.resourceGroupMutex.RLock()
+	defer is.resourceGroupMutex.RUnlock()
+	for _, v := range is.resourceGroupMap {
+		if v.ID == id {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
 // AllResourceGroups returns all resource groups.
-func (is *infoSchema) AllResourceGroups() []*model.ResourceGroupInfo {
+func (is *infoSchemaMisc) AllResourceGroups() []*model.ResourceGroupInfo {
 	is.resourceGroupMutex.RLock()
 	defer is.resourceGroupMutex.RUnlock()
 	groups := make([]*model.ResourceGroupInfo, 0, len(is.resourceGroupMap))
@@ -435,8 +719,349 @@ func (is *infoSchema) AllResourceGroups() []*model.ResourceGroupInfo {
 	return groups
 }
 
+func (is *infoSchemaMisc) CloneResourceGroups() map[string]*model.ResourceGroupInfo {
+	is.resourceGroupMutex.RLock()
+	defer is.resourceGroupMutex.RUnlock()
+	return maps.Clone(is.resourceGroupMap)
+}
+
+// AllMaskingPolicies returns all masking policies in a stable order with delayed loading.
+func (is *infoSchema) AllMaskingPolicies() []*model.MaskingPolicyInfo {
+	is.loadMaskingPoliciesIfNeeded()
+
+	is.maskingPolicyMutex.RLock()
+	defer is.maskingPolicyMutex.RUnlock()
+	policies := make([]*model.MaskingPolicyInfo, 0)
+	for _, colMap := range is.maskingPolicyTableColumnMap {
+		for _, policy := range colMap {
+			policies = append(policies, policy)
+		}
+	}
+	sort.Slice(policies, func(i, j int) bool {
+		if policies[i].Name.L == policies[j].Name.L {
+			return policies[i].ID < policies[j].ID
+		}
+		return policies[i].Name.L < policies[j].Name.L
+	})
+	return policies
+}
+
+func (is *infoSchema) CloneMaskingPoliciesByTableColumn() map[int64]map[int64]*model.MaskingPolicyInfo {
+	is.loadMaskingPoliciesIfNeeded()
+
+	is.maskingPolicyMutex.RLock()
+	defer is.maskingPolicyMutex.RUnlock()
+	cloned := make(map[int64]map[int64]*model.MaskingPolicyInfo, len(is.maskingPolicyTableColumnMap))
+	for tableID, colMap := range is.maskingPolicyTableColumnMap {
+		cloned[tableID] = maps.Clone(colMap)
+	}
+	return cloned
+}
+
+// loadMaskingPoliciesIfNeeded loads masking policies from system table on first access.
+// Only one goroutine performs loading, others wait for completion.
+func (is *infoSchema) loadMaskingPoliciesIfNeeded() {
+	for {
+		var loadCh chan struct{}
+		is.maskingPolicyMutex.Lock()
+		if is.maskingPoliciesLoaded {
+			is.maskingPolicyMutex.Unlock()
+			return
+		}
+		if is.factory == nil {
+			logutil.BgLogger().Debug("factory is nil, skipping masking policies loading")
+			is.maskingPoliciesLoaded = true
+			is.maskingPolicyMutex.Unlock()
+			return
+		}
+		if is.maskingPoliciesLoadCh != nil {
+			loadCh = is.maskingPoliciesLoadCh
+			is.maskingPolicyMutex.Unlock()
+			<-loadCh
+			continue
+		}
+		loadCh = make(chan struct{})
+		is.maskingPoliciesLoadCh = loadCh
+		is.maskingPolicyMutex.Unlock()
+
+		policies, err := LoadMaskingPolicies(is.factory, is.ts)
+
+		is.maskingPolicyMutex.Lock()
+		if err != nil {
+			if isMaskingPolicyTableNotReady(err) {
+				logutil.BgLogger().Debug("masking policy table not available yet, skipping", zap.Error(err))
+				is.maskingPoliciesLoaded = true
+			} else {
+				logutil.BgLogger().Warn("failed to load masking policies", zap.Error(err))
+			}
+		} else if !is.maskingPoliciesLoaded {
+			newMap := make(map[int64]map[int64]*model.MaskingPolicyInfo, len(policies))
+			for _, policy := range policies {
+				if newMap[policy.TableID] == nil {
+					newMap[policy.TableID] = make(map[int64]*model.MaskingPolicyInfo)
+				}
+				newMap[policy.TableID][policy.ColumnID] = policy
+			}
+			is.maskingPolicyTableColumnMap = newMap
+			is.maskingPoliciesLoaded = true
+			logutil.BgLogger().Info("masking policies loaded", zap.Int("count", len(policies)))
+		}
+		close(loadCh)
+		is.maskingPoliciesLoadCh = nil
+		is.maskingPolicyMutex.Unlock()
+		return
+	}
+}
+
+// LoadMaskingPolicies loads all masking policy metadata through mysql.tidb_masking_policy.
+func LoadMaskingPolicies(factory func() (pools.Resource, error), snapshotTS uint64) ([]*model.MaskingPolicyInfo, error) {
+	return loadMaskingPoliciesWithTableIDs(factory, nil, snapshotTS)
+}
+
+// loadMaskingPoliciesWithTableIDs loads masking policy metadata through mysql.tidb_masking_policy.
+// If tableIDs is empty, all policies are loaded.
+// snapshotTS is used for snapshot-aware loading: when non-zero, the query runs at that timestamp
+// to preserve stale-read semantics.
+func loadMaskingPoliciesWithTableIDs(factory func() (pools.Resource, error), tableIDs []int64, snapshotTS uint64) ([]*model.MaskingPolicyInfo, error) {
+	const maxBatchSize = 1024
+
+	resource, err := factory()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if closer, ok := resource.(interface{ Close() }); ok {
+		defer closer.Close()
+	}
+
+	sctx, ok := resource.(sessionctx.Context)
+	if !ok {
+		return nil, errors.New("failed to cast resource to sessionctx.Context")
+	}
+
+	ids, hasFilter := normalizeMaskingPolicyTableIDs(tableIDs)
+	if hasFilter && len(ids) == 0 {
+		return nil, nil
+	}
+
+	loadBatch := func(batchIDs []int64, policies []*model.MaskingPolicyInfo) ([]*model.MaskingPolicyInfo, error) {
+		query, args := buildLoadMaskingPoliciesQuery(batchIDs)
+		internalCtx := kv.WithInternalSourceType(stdctx.Background(), kv.InternalTxnDDL)
+		opts := []sqlexec.OptionFuncAlias{sqlexec.ExecOptionUseCurSession}
+		if snapshotTS > 0 {
+			opts = append(opts, sqlexec.ExecOptionWithSnapshot(snapshotTS))
+		}
+		rows, _, err := sctx.GetRestrictedSQLExecutor().ExecRestrictedSQL(
+			internalCtx,
+			opts,
+			query,
+			args...,
+		)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+
+		for _, row := range rows {
+			policy, err := maskingPolicyInfoFromChunkRow(row)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			policies = append(policies, policy)
+		}
+		return policies, nil
+	}
+
+	policies := make([]*model.MaskingPolicyInfo, 0)
+	if !hasFilter {
+		policies, err = loadBatch(nil, policies)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		for start := 0; start < len(ids); start += maxBatchSize {
+			end := min(start+maxBatchSize, len(ids))
+			policies, err = loadBatch(ids[start:end], policies)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	slices.SortFunc(policies, func(a, b *model.MaskingPolicyInfo) int {
+		if x := cmp.Compare(a.TableID, b.TableID); x != 0 {
+			return x
+		}
+		if x := cmp.Compare(a.ColumnID, b.ColumnID); x != 0 {
+			return x
+		}
+		return cmp.Compare(a.ID, b.ID)
+	})
+	return policies, nil
+}
+
+func buildLoadMaskingPoliciesQuery(tableIDs []int64) (string, []any) {
+	const baseQuery = `SELECT policy_id, policy_name, db_name, table_name, table_id, column_name, column_id, expression, status, masking_type, restrict_on, created_at, updated_at, created_by
+FROM mysql.tidb_masking_policy`
+
+	var sb strings.Builder
+	sb.WriteString(baseQuery)
+	args := make([]any, 0, len(tableIDs))
+	if len(tableIDs) > 0 {
+		sb.WriteString(" WHERE table_id IN (")
+		for i, id := range tableIDs {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString("%?")
+			args = append(args, id)
+		}
+		sb.WriteString(")")
+	}
+	sb.WriteString(" ORDER BY table_id, column_id, policy_id")
+	return sb.String(), args
+}
+
+func normalizeMaskingPolicyTableIDs(tableIDs []int64) ([]int64, bool) {
+	hasFilter := len(tableIDs) > 0
+	if !hasFilter {
+		return nil, false
+	}
+
+	idSet := make(map[int64]struct{}, len(tableIDs))
+	ids := make([]int64, 0, len(tableIDs))
+	for _, id := range tableIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := idSet[id]; ok {
+			continue
+		}
+		idSet[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids, true
+}
+
+func maskingPolicyInfoFromChunkRow(row chunk.Row) (*model.MaskingPolicyInfo, error) {
+	status, err := maskingPolicyStatusFromString(row.GetString(8))
+	if err != nil {
+		return nil, err
+	}
+	restrictOn := ""
+	if !row.IsNull(10) {
+		restrictOn = row.GetString(10)
+	}
+	restrictOps, err := maskingPolicyRestrictOpsFromString(restrictOn)
+	if err != nil {
+		return nil, err
+	}
+
+	createdAt := time.Time{}
+	if !row.IsNull(11) {
+		createdAt, err = row.GetTime(11).GoTime(time.Local)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+	updatedAt := time.Time{}
+	if !row.IsNull(12) {
+		updatedAt, err = row.GetTime(12).GoTime(time.Local)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+	createdBy := ""
+	if !row.IsNull(13) {
+		createdBy = row.GetString(13)
+	}
+	maskingType, err := maskingPolicyTypeFromString(row.GetString(9))
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.MaskingPolicyInfo{
+		ID:          row.GetInt64(0),
+		Name:        ast.NewCIStr(row.GetString(1)),
+		DBName:      ast.NewCIStr(row.GetString(2)),
+		TableName:   ast.NewCIStr(row.GetString(3)),
+		TableID:     row.GetInt64(4),
+		ColumnName:  ast.NewCIStr(row.GetString(5)),
+		ColumnID:    row.GetInt64(6),
+		Expression:  row.GetString(7),
+		Status:      status,
+		MaskingType: maskingType,
+		RestrictOps: restrictOps,
+		CreatedAt:   createdAt,
+		UpdatedAt:   updatedAt,
+		CreatedBy:   createdBy,
+		State:       model.StatePublic,
+	}, nil
+}
+
+func maskingPolicyStatusFromString(status string) (model.MaskingPolicyStatus, error) {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "ENABLE", "ENABLED":
+		return model.MaskingPolicyStatusEnable, nil
+	case "DISABLE", "DISABLED":
+		return model.MaskingPolicyStatusDisable, nil
+	default:
+		return model.MaskingPolicyStatusDisable, errors.Errorf("unknown masking policy status: %s", status)
+	}
+}
+
+func maskingPolicyTypeFromString(tp string) (model.MaskingPolicyType, error) {
+	normalized := model.MaskingPolicyType(strings.ToUpper(strings.TrimSpace(tp)))
+	switch normalized {
+	case model.MaskingPolicyTypeFull,
+		model.MaskingPolicyTypePartial,
+		model.MaskingPolicyTypeNull,
+		model.MaskingPolicyTypeDate,
+		model.MaskingPolicyTypeCustom:
+		return normalized, nil
+	default:
+		return "", errors.Errorf("unknown masking policy type: %s", tp)
+	}
+}
+
+func maskingPolicyRestrictOpsFromString(restrictOn string) (ast.MaskingPolicyRestrictOps, error) {
+	restrictOn = strings.TrimSpace(strings.ToUpper(restrictOn))
+	if restrictOn == "" || restrictOn == "NONE" {
+		return ast.MaskingPolicyRestrictOpNone, nil
+	}
+	ops := ast.MaskingPolicyRestrictOpNone
+	for _, token := range strings.Split(restrictOn, ",") {
+		switch strings.TrimSpace(token) {
+		case ast.MaskingPolicyRestrictNameInsertIntoSelect:
+			ops |= ast.MaskingPolicyRestrictOpInsertIntoSelect
+		case ast.MaskingPolicyRestrictNameUpdateSelect:
+			ops |= ast.MaskingPolicyRestrictOpUpdateSelect
+		case ast.MaskingPolicyRestrictNameDeleteSelect:
+			ops |= ast.MaskingPolicyRestrictOpDeleteSelect
+		case ast.MaskingPolicyRestrictNameCTAS:
+			ops |= ast.MaskingPolicyRestrictOpCTAS
+		case "NONE", "":
+			// No-op.
+		default:
+			return ast.MaskingPolicyRestrictOpNone, errors.Errorf("unknown masking policy restrict option: %s", token)
+		}
+	}
+	return ops, nil
+}
+
+func isMaskingPolicyTableNotReady(err error) bool {
+	return ErrTableNotExists.Equal(err)
+}
+
+func (is *infoSchema) resetMaskingPolicyCache() {
+	is.maskingPolicyMutex.Lock()
+	defer is.maskingPolicyMutex.Unlock()
+	is.maskingPoliciesLoaded = false
+	is.maskingPolicyTableColumnMap = make(map[int64]map[int64]*model.MaskingPolicyInfo)
+	is.maskingPoliciesLoadCh = nil
+}
+
 // AllPlacementPolicies returns all placement policies
-func (is *infoSchema) AllPlacementPolicies() []*model.PolicyInfo {
+func (is *infoSchemaMisc) AllPlacementPolicies() []*model.PolicyInfo {
 	is.policyMutex.RLock()
 	defer is.policyMutex.RUnlock()
 	policies := make([]*model.PolicyInfo, 0, len(is.policyMap))
@@ -446,12 +1071,18 @@ func (is *infoSchema) AllPlacementPolicies() []*model.PolicyInfo {
 	return policies
 }
 
-func (is *infoSchema) PlacementBundleByPhysicalTableID(id int64) (*placement.Bundle, bool) {
+func (is *infoSchemaMisc) ClonePlacementPolicies() map[string]*model.PolicyInfo {
+	is.policyMutex.RLock()
+	defer is.policyMutex.RUnlock()
+	return maps.Clone(is.policyMap)
+}
+
+func (is *infoSchemaMisc) PlacementBundleByPhysicalTableID(id int64) (*placement.Bundle, bool) {
 	t, r := is.ruleBundleMap[id]
 	return t, r
 }
 
-func (is *infoSchema) AllPlacementBundles() []*placement.Bundle {
+func (is *infoSchemaMisc) AllPlacementBundles() []*placement.Bundle {
 	bundles := make([]*placement.Bundle, 0, len(is.ruleBundleMap))
 	for _, bundle := range is.ruleBundleMap {
 		bundles = append(bundles, bundle)
@@ -459,31 +1090,31 @@ func (is *infoSchema) AllPlacementBundles() []*placement.Bundle {
 	return bundles
 }
 
-func (is *infoSchema) setResourceGroup(resourceGroup *model.ResourceGroupInfo) {
+func (is *infoSchemaMisc) setResourceGroup(resourceGroup *model.ResourceGroupInfo) {
 	is.resourceGroupMutex.Lock()
 	defer is.resourceGroupMutex.Unlock()
 	is.resourceGroupMap[resourceGroup.Name.L] = resourceGroup
 }
 
-func (is *infoSchema) deleteResourceGroup(name string) {
+func (is *infoSchemaMisc) deleteResourceGroup(name string) {
 	is.resourceGroupMutex.Lock()
 	defer is.resourceGroupMutex.Unlock()
 	delete(is.resourceGroupMap, name)
 }
 
-func (is *infoSchema) setPolicy(policy *model.PolicyInfo) {
+func (is *infoSchemaMisc) setPolicy(policy *model.PolicyInfo) {
 	is.policyMutex.Lock()
 	defer is.policyMutex.Unlock()
 	is.policyMap[policy.Name.L] = policy
 }
 
-func (is *infoSchema) deletePolicy(name string) {
+func (is *infoSchemaMisc) deletePolicy(name string) {
 	is.policyMutex.Lock()
 	defer is.policyMutex.Unlock()
 	delete(is.policyMap, name)
 }
 
-func (is *infoSchema) addReferredForeignKeys(schema model.CIStr, tbInfo *model.TableInfo) {
+func (is *infoSchema) addReferredForeignKeys(schema ast.CIStr, tbInfo *model.TableInfo) {
 	for _, fk := range tbInfo.ForeignKeys {
 		if fk.Version < model.FKVersion1 {
 			continue
@@ -523,7 +1154,7 @@ func (is *infoSchema) addReferredForeignKeys(schema model.CIStr, tbInfo *model.T
 	}
 }
 
-func (is *infoSchema) deleteReferredForeignKeys(schema model.CIStr, tbInfo *model.TableInfo) {
+func (is *infoSchema) deleteReferredForeignKeys(schema ast.CIStr, tbInfo *model.TableInfo) {
 	for _, fk := range tbInfo.ForeignKeys {
 		if fk.Version < model.FKVersion1 {
 			continue
@@ -550,6 +1181,10 @@ func (is *infoSchema) GetTableReferredForeignKeys(schema, table string) []*model
 	return is.referredForeignKeyMap[name]
 }
 
+func (is *infoSchema) GetAutoIDRequirement() autoid.Requirement {
+	return is.r
+}
+
 // SessionTables store local temporary tables
 type SessionTables struct {
 	// Session tables can be accessed after the db is dropped, so there needs a way to retain the DBInfo.
@@ -568,7 +1203,7 @@ func NewSessionTables() *SessionTables {
 }
 
 // TableByName get table by name
-func (is *SessionTables) TableByName(schema, table model.CIStr) (table.Table, bool) {
+func (is *SessionTables) TableByName(ctx stdctx.Context, schema, table ast.CIStr) (table.Table, bool) {
 	if tbNames, ok := is.schemaMap[schema.L]; ok {
 		if t, ok := tbNames.tables[table.L]; ok {
 			return t, true
@@ -578,8 +1213,8 @@ func (is *SessionTables) TableByName(schema, table model.CIStr) (table.Table, bo
 }
 
 // TableExists check if table with the name exists
-func (is *SessionTables) TableExists(schema, table model.CIStr) (ok bool) {
-	_, ok = is.TableByName(schema, table)
+func (is *SessionTables) TableExists(schema, table ast.CIStr) (ok bool) {
+	_, ok = is.TableByName(stdctx.Background(), schema, table)
 	return
 }
 
@@ -592,7 +1227,6 @@ func (is *SessionTables) TableByID(id int64) (tbl table.Table, ok bool) {
 // AddTable add a table
 func (is *SessionTables) AddTable(db *model.DBInfo, tbl table.Table) error {
 	schemaTables := is.ensureSchema(db)
-
 	tblMeta := tbl.Meta()
 	if _, ok := schemaTables.tables[tblMeta.Name.L]; ok {
 		return ErrTableExists.GenWithStackByArgs(tblMeta.Name)
@@ -601,6 +1235,7 @@ func (is *SessionTables) AddTable(db *model.DBInfo, tbl table.Table) error {
 	if _, ok := is.idx2table[tblMeta.ID]; ok {
 		return ErrTableExists.GenWithStackByArgs(tblMeta.Name)
 	}
+	intest.Assert(db.ID == tbl.Meta().DBID)
 
 	schemaTables.tables[tblMeta.Name.L] = tbl
 	is.idx2table[tblMeta.ID] = tbl
@@ -609,7 +1244,7 @@ func (is *SessionTables) AddTable(db *model.DBInfo, tbl table.Table) error {
 }
 
 // RemoveTable remove a table
-func (is *SessionTables) RemoveTable(schema, table model.CIStr) (exist bool) {
+func (is *SessionTables) RemoveTable(schema, table ast.CIStr) (exist bool) {
 	tbls := is.schemaTables(schema)
 	if tbls == nil {
 		return false
@@ -633,17 +1268,11 @@ func (is *SessionTables) Count() int {
 	return len(is.idx2table)
 }
 
-// SchemaByTable get a table's schema name
-func (is *SessionTables) SchemaByTable(tableInfo *model.TableInfo) (*model.DBInfo, bool) {
-	if tableInfo == nil {
-		return nil, false
-	}
-
+// SchemaByID get a table's schema from the schema ID.
+func (is *SessionTables) SchemaByID(id int64) (*model.DBInfo, bool) {
 	for _, v := range is.schemaMap {
-		if tbl, ok := v.tables[tableInfo.Name.L]; ok {
-			if tbl.Meta().ID == tableInfo.ID {
-				return v.dbInfo, true
-			}
+		if v.dbInfo.ID == id {
+			return v.dbInfo, true
 		}
 	}
 
@@ -660,7 +1289,7 @@ func (is *SessionTables) ensureSchema(db *model.DBInfo) *schemaTables {
 	return tbls
 }
 
-func (is *SessionTables) schemaTables(schema model.CIStr) *schemaTables {
+func (is *SessionTables) schemaTables(schema ast.CIStr) *schemaTables {
 	if is.schemaMap == nil {
 		return nil
 	}
@@ -683,24 +1312,55 @@ type SessionExtendedInfoSchema struct {
 }
 
 // TableByName implements InfoSchema.TableByName
-func (ts *SessionExtendedInfoSchema) TableByName(schema, table model.CIStr) (table.Table, error) {
+func (ts *SessionExtendedInfoSchema) TableByName(ctx stdctx.Context, schema, table ast.CIStr) (table.Table, error) {
+	if tbl, ok := ts.sessionTableByName(ctx, schema, table); ok {
+		return tbl, nil
+	}
+	return ts.InfoSchema.TableByName(ctx, schema, table)
+}
+
+func (ts *SessionExtendedInfoSchema) sessionTableByName(ctx stdctx.Context, schema, table ast.CIStr) (table.Table, bool) {
 	if ts.LocalTemporaryTables != nil {
-		if tbl, ok := ts.LocalTemporaryTables.TableByName(schema, table); ok {
-			return tbl, nil
+		if tbl, ok := ts.LocalTemporaryTables.TableByName(ctx, schema, table); ok {
+			return tbl, true
 		}
 	}
 
 	if ts.MdlTables != nil {
-		if tbl, ok := ts.MdlTables.TableByName(schema, table); ok {
-			return tbl, nil
+		if tbl, ok := ts.MdlTables.TableByName(ctx, schema, table); ok {
+			return tbl, true
 		}
 	}
 
-	return ts.InfoSchema.TableByName(schema, table)
+	return nil, false
+}
+
+// TableInfoByName implements InfoSchema.TableInfoByName
+func (ts *SessionExtendedInfoSchema) TableInfoByName(schema, table ast.CIStr) (*model.TableInfo, error) {
+	tbl, err := ts.TableByName(stdctx.Background(), schema, table)
+	return getTableInfo(tbl), err
+}
+
+// TableInfoByID implements InfoSchema.TableInfoByID
+func (ts *SessionExtendedInfoSchema) TableInfoByID(id int64) (*model.TableInfo, bool) {
+	tbl, ok := ts.TableByID(stdctx.Background(), id)
+	return getTableInfo(tbl), ok
+}
+
+// FindTableInfoByPartitionID implements InfoSchema.FindTableInfoByPartitionID
+func (ts *SessionExtendedInfoSchema) FindTableInfoByPartitionID(
+	partitionID int64,
+) (*model.TableInfo, *model.DBInfo, *model.PartitionDefinition) {
+	tbl, db, partDef := ts.FindTableByPartitionID(partitionID)
+	return getTableInfo(tbl), db, partDef
 }
 
 // TableByID implements InfoSchema.TableByID
-func (ts *SessionExtendedInfoSchema) TableByID(id int64) (table.Table, bool) {
+func (ts *SessionExtendedInfoSchema) TableByID(ctx stdctx.Context, id int64) (table.Table, bool) {
+	if !tableIDIsValid(id) {
+		return nil, false
+	}
+
 	if ts.LocalTemporaryTables != nil {
 		if tbl, ok := ts.LocalTemporaryTables.TableByID(id); ok {
 			return tbl, true
@@ -713,28 +1373,25 @@ func (ts *SessionExtendedInfoSchema) TableByID(id int64) (table.Table, bool) {
 		}
 	}
 
-	return ts.InfoSchema.TableByID(id)
+	return ts.InfoSchema.TableByID(ctx, id)
 }
 
-// SchemaByTable implements InfoSchema.SchemaByTable, it returns a stale DBInfo even if it's dropped.
-func (ts *SessionExtendedInfoSchema) SchemaByTable(tableInfo *model.TableInfo) (*model.DBInfo, bool) {
-	if tableInfo == nil {
-		return nil, false
-	}
-
+// SchemaByID implements InfoSchema.SchemaByID, it returns a stale DBInfo even if it's dropped.
+func (ts *SessionExtendedInfoSchema) SchemaByID(id int64) (*model.DBInfo, bool) {
 	if ts.LocalTemporaryTables != nil {
-		if db, ok := ts.LocalTemporaryTables.SchemaByTable(tableInfo); ok {
+		if db, ok := ts.LocalTemporaryTables.SchemaByID(id); ok {
 			return db, true
 		}
 	}
 
 	if ts.MdlTables != nil {
-		if tbl, ok := ts.MdlTables.SchemaByTable(tableInfo); ok {
+		if tbl, ok := ts.MdlTables.SchemaByID(id); ok {
 			return tbl, true
 		}
 	}
 
-	return ts.InfoSchema.SchemaByTable(tableInfo)
+	ret, ok := ts.InfoSchema.SchemaByID(id)
+	return ret, ok
 }
 
 // UpdateTableInfo implements InfoSchema.SchemaByTable.
@@ -768,10 +1425,17 @@ func (ts *SessionExtendedInfoSchema) DetachTemporaryTableInfoSchema() *SessionEx
 // If the id is a partition id, the corresponding table.Table and PartitionDefinition will be returned.
 // If the id is not found in the InfoSchema, nil will be returned for both return values.
 func FindTableByTblOrPartID(is InfoSchema, id int64) (table.Table, *model.PartitionDefinition) {
-	tbl, ok := is.TableByID(id)
+	tbl, ok := is.TableByID(stdctx.Background(), id)
 	if ok {
 		return tbl, nil
 	}
 	tbl, _, partDef := is.FindTableByPartitionID(id)
 	return tbl, partDef
+}
+
+func getTableInfo(tbl table.Table) *model.TableInfo {
+	if tbl == nil {
+		return nil
+	}
+	return tbl.Meta()
 }

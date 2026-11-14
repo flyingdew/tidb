@@ -21,8 +21,8 @@ import (
 	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/infoschema"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/table"
@@ -122,7 +122,7 @@ func findPositionRelativeColumn(cols []*table.Column, pos *ast.ColumnPosition) (
 
 // findDependedColumnNames returns a set of string, which indicates
 // the names of the columns that are depended by colDef.
-func findDependedColumnNames(schemaName model.CIStr, tableName model.CIStr, colDef *ast.ColumnDef) (generated bool, colsMap map[string]struct{}, err error) {
+func findDependedColumnNames(schemaName ast.CIStr, tableName ast.CIStr, colDef *ast.ColumnDef) (generated bool, colsMap map[string]struct{}, err error) {
 	colsMap = make(map[string]struct{})
 	for _, option := range colDef.Options {
 		if option.Tp == ast.ColumnOptionGenerated {
@@ -146,12 +146,12 @@ func findDependedColumnNames(schemaName model.CIStr, tableName model.CIStr, colD
 // FindColumnNamesInExpr returns a slice of ast.ColumnName which is referred in expr.
 func FindColumnNamesInExpr(expr ast.ExprNode) []*ast.ColumnName {
 	var c generatedColumnChecker
-	expr.Accept(&c)
+	ast.Walk(expr, &c)
 	return c.cols
 }
 
 // hasDependentByGeneratedColumn checks whether there are other columns depend on this column or not.
-func hasDependentByGeneratedColumn(tblInfo *model.TableInfo, colName model.CIStr) (bool, string, bool) {
+func hasDependentByGeneratedColumn(tblInfo *model.TableInfo, colName ast.CIStr) (bool, string, bool) {
 	for _, col := range tblInfo.Columns {
 		for dep := range col.Dependences {
 			if dep == colName.L {
@@ -163,10 +163,12 @@ func hasDependentByGeneratedColumn(tblInfo *model.TableInfo, colName model.CIStr
 }
 
 func isGeneratedRelatedColumn(tblInfo *model.TableInfo, newCol, col *model.ColumnInfo) error {
-	if newCol.IsGenerated() || col.IsGenerated() {
-		// TODO: Make it compatible with MySQL error.
-		msg := fmt.Sprintf("newCol IsGenerated %v, oldCol IsGenerated %v", newCol.IsGenerated(), col.IsGenerated())
-		return dbterror.ErrUnsupportedModifyColumn.GenWithStackByArgs(msg)
+	// TODO: Make it compatible with MySQL error.
+	if newCol.IsGenerated() {
+		return dbterror.ErrUnsupportedModifyColumn.GenWithStackByArgs("new column is generated")
+	}
+	if col.IsGenerated() {
+		return dbterror.ErrUnsupportedModifyColumn.GenWithStackByArgs("old column is generated")
 	}
 	if ok, dep, _ := hasDependentByGeneratedColumn(tblInfo, col.Name); ok {
 		msg := fmt.Sprintf("oldCol is a dependent column '%s' for generated column", dep)
@@ -179,15 +181,15 @@ type generatedColumnChecker struct {
 	cols []*ast.ColumnName
 }
 
-func (*generatedColumnChecker) Enter(inNode ast.Node) (outNode ast.Node, skipChildren bool) {
-	return inNode, false
+func (*generatedColumnChecker) Enter(ast.Node) (skipChildren bool) {
+	return false
 }
 
-func (c *generatedColumnChecker) Leave(inNode ast.Node) (node ast.Node, ok bool) {
+func (c *generatedColumnChecker) Leave(inNode ast.Node) (proceed bool) {
 	if x, ok := inNode.(*ast.ColumnName); ok {
 		c.cols = append(c.cols, x)
 	}
-	return inNode, true
+	return true
 }
 
 // checkModifyGeneratedColumn checks the modification between
@@ -197,10 +199,10 @@ func (c *generatedColumnChecker) Leave(inNode ast.Node) (node ast.Node, ok bool)
 //  3. check if the modified expr contains non-deterministic functions
 //  4. check whether new column refers to any auto-increment columns.
 //  5. check if the new column is indexed or stored
-func checkModifyGeneratedColumn(sctx sessionctx.Context, schemaName model.CIStr, tbl table.Table, oldCol, newCol *table.Column, newColDef *ast.ColumnDef, pos *ast.ColumnPosition) error {
+func checkModifyGeneratedColumn(sctx sessionctx.Context, schemaName ast.CIStr, tbl table.Table, oldCol, newCol *table.Column, newColDef *ast.ColumnDef, pos *ast.ColumnPosition) error {
 	// rule 1.
-	oldColIsStored := !oldCol.IsGenerated() || oldCol.GeneratedStored
-	newColIsStored := !newCol.IsGenerated() || newCol.GeneratedStored
+	oldColIsStored := !oldCol.IsVirtualGenerated()
+	newColIsStored := !newCol.IsVirtualGenerated()
 	if oldColIsStored != newColIsStored {
 		return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStackByArgs("Changing the STORED status")
 	}
@@ -255,16 +257,23 @@ func checkModifyGeneratedColumn(sctx sessionctx.Context, schemaName model.CIStr,
 		if err := checkIllegalFn4Generated(newCol.Name.L, typeColumn, newCol.GeneratedExpr.Internal()); err != nil {
 			return errors.Trace(err)
 		}
+		if err := checkEmbedTextGeneratedColumn(newCol.Name.L, newCol.GeneratedExpr.Internal(), newCol.GeneratedStored); err != nil {
+			return errors.Trace(err)
+		}
 
 		// rule 4.
 		_, dependColNames, err := findDependedColumnNames(schemaName, tbl.Meta().Name, newColDef)
 		if err != nil {
 			return errors.Trace(err)
 		}
+		//nolint:forbidigo
 		if !sctx.GetSessionVars().EnableAutoIncrementInGenerated {
 			if err := checkAutoIncrementRef(newColDef.Name.Name.L, dependColNames, tbl.Meta()); err != nil {
 				return errors.Trace(err)
 			}
+		}
+		if depCol, ok := findEmbedTextDependency(dependColNames, tbl.Cols()); ok {
+			return embedTextDependencyErr(newCol.Name.L, depCol)
 		}
 
 		// rule 5.
@@ -284,21 +293,27 @@ type illegalFunctionChecker struct {
 	hasCastArrayFunc      bool
 	disallowCastArrayFunc bool
 	otherErr              error
+	allowEmbedText        bool
 }
 
-func (c *illegalFunctionChecker) Enter(inNode ast.Node) (outNode ast.Node, skipChildren bool) {
+func (c *illegalFunctionChecker) Enter(inNode ast.Node) (skipChildren bool) {
 	switch node := inNode.(type) {
 	case *ast.FuncCallExpr:
+		// Grouping function is not allowed, issue #49909.
+		if node.FnName.L == ast.Grouping {
+			c.hasAggFunc = true
+			return true
+		}
 		// Blocked functions & non-builtin functions is not allowed
 		_, isFunctionBlocked := expression.IllegalFunctions4GeneratedColumns[node.FnName.L]
-		if isFunctionBlocked || !expression.IsFunctionSupported(node.FnName.L) {
+		if (isFunctionBlocked && !(c.allowEmbedText && node.FnName.L == ast.EmbedText)) || !expression.IsFunctionSupported(node.FnName.L) {
 			c.hasIllegalFunc = true
-			return inNode, true
+			return true
 		}
 		err := expression.VerifyArgsWrapper(node.FnName.L, len(node.Args))
 		if err != nil {
 			c.otherErr = err
-			return inNode, true
+			return true
 		}
 		_, isFuncGA := variable.GAFunction4ExpressionIndex[node.FnName.L]
 		if !isFuncGA {
@@ -307,32 +322,32 @@ func (c *illegalFunctionChecker) Enter(inNode ast.Node) (outNode ast.Node, skipC
 	case *ast.SubqueryExpr, *ast.ValuesExpr, *ast.VariableExpr:
 		// Subquery & `values(x)` & variable is not allowed
 		c.hasIllegalFunc = true
-		return inNode, true
+		return true
 	case *ast.AggregateFuncExpr:
 		// Aggregate function is not allowed
 		c.hasAggFunc = true
-		return inNode, true
+		return true
 	case *ast.RowExpr:
 		c.hasRowVal = true
-		return inNode, true
+		return true
 	case *ast.WindowFuncExpr:
 		c.hasWindowFunc = true
-		return inNode, true
+		return true
 	case *ast.FuncCastExpr:
 		c.hasCastArrayFunc = c.hasCastArrayFunc || node.Tp.IsArray()
 		if c.disallowCastArrayFunc && node.Tp.IsArray() {
 			c.otherErr = expression.ErrNotSupportedYet.GenWithStackByArgs("Use of CAST( .. AS .. ARRAY) outside of functional index in CREATE(non-SELECT)/ALTER TABLE or in general expressions")
-			return inNode, true
+			return true
 		}
 	case *ast.ParenthesesExpr:
-		return inNode, false
+		return false
 	}
 	c.disallowCastArrayFunc = true
-	return inNode, false
+	return false
 }
 
-func (*illegalFunctionChecker) Leave(inNode ast.Node) (node ast.Node, ok bool) {
-	return inNode, true
+func (*illegalFunctionChecker) Leave(ast.Node) (proceed bool) {
+	return true
 }
 
 const (
@@ -344,8 +359,11 @@ func checkIllegalFn4Generated(name string, genType int, expr ast.ExprNode) error
 	if expr == nil {
 		return nil
 	}
-	var c illegalFunctionChecker
-	expr.Accept(&c)
+	// All generated-column call sites apply checkEmbedTextGeneratedColumn next,
+	// which admits only the dedicated STORED EMBED_TEXT form. Functional
+	// indexes keep EMBED_TEXT blocked by the general illegal-function list.
+	c := illegalFunctionChecker{allowEmbedText: genType == typeColumn}
+	ast.Walk(expr, &c)
 	if c.hasIllegalFunc {
 		switch genType {
 		case typeColumn:
@@ -381,20 +399,32 @@ func checkIllegalFn4Generated(name string, genType int, expr ast.ExprNode) error
 }
 
 func checkIndexOrStored(tbl table.Table, oldCol, newCol *table.Column) error {
+	isIndexed := false
+	for _, idx := range tbl.Indices() {
+		for _, col := range idx.Meta().Columns {
+			if col.Name.L == oldCol.Name.L || col.Name.L == newCol.Name.L {
+				isIndexed = true
+				break
+			}
+		}
+		if isIndexed {
+			break
+		}
+	}
+
 	if oldCol.GeneratedExprString == newCol.GeneratedExprString {
-		return nil
+		if oldCol.FieldType.Equal(&newCol.FieldType) || !isIndexed {
+			return nil
+		}
+		return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStack("Unsupported modification for generated columns covered by an index")
 	}
 
 	if newCol.GeneratedStored {
 		return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStackByArgs("modifying a stored column")
 	}
 
-	for _, idx := range tbl.Indices() {
-		for _, col := range idx.Meta().Columns {
-			if col.Name.L == newCol.Name.L {
-				return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStackByArgs("modifying an indexed column")
-			}
-		}
+	if isIndexed {
+		return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStack("Unsupported modification for generated columns covered by an index")
 	}
 	return nil
 }
@@ -420,4 +450,39 @@ func checkExpressionIndexAutoIncrement(name string, dependencies map[string]stru
 		}
 	}
 	return nil
+}
+
+func checkEmbedTextGeneratedColumn(name string, expr ast.ExprNode, isStored bool) error {
+	if !expression.ContainsEmbedTextFunc(expr) {
+		return nil
+	}
+	if err := expression.CheckEmbedTextAllowed(); err != nil {
+		return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStack(err.Error())
+	}
+	if !expression.IsEmbedTextFuncCall(expr) {
+		return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStack("using EMBED_TEXT() as a nested expression inside other functions or expressions")
+	}
+	if !isStored {
+		return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStack("using EMBED_TEXT() in a virtual generated column")
+	}
+	if _, err := expression.ExtractEmbedTextInfo(expr); err != nil {
+		return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStack("EMBED_TEXT() usage in generated column '%s': %v", name, err)
+	}
+	return nil
+}
+
+func findEmbedTextDependency(dependColNames map[string]struct{}, cols []*table.Column) (string, bool) {
+	for _, col := range cols {
+		if _, ok := dependColNames[col.Name.L]; !ok {
+			continue
+		}
+		if col.IsGenerated() && expression.IsEmbedTextFuncCall(col.GeneratedExpr.Internal()) {
+			return col.Name.L, true
+		}
+	}
+	return "", false
+}
+
+func embedTextDependencyErr(colName, depCol string) error {
+	return dbterror.ErrUnsupportedOnGeneratedColumn.GenWithStack("generated column '%s' depends on generated column '%s' that uses EMBED_TEXT()", colName, depCol)
 }

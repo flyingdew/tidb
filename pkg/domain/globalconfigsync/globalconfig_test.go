@@ -23,6 +23,7 @@ import (
 	"github.com/pingcap/tidb/pkg/domain/globalconfigsync"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/session"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/store/mockstore"
 	"github.com/pingcap/tidb/pkg/testkit/testsetup"
 	"github.com/stretchr/testify/require"
@@ -36,6 +37,7 @@ func TestMain(m *testing.M) {
 	testsetup.SetupForCommonTest()
 	opts := []goleak.Option{
 		goleak.IgnoreTopFunction("github.com/golang/glog.(*fileSink).flushDaemon"),
+		goleak.IgnoreTopFunction("github.com/bazelbuild/rules_go/go/tools/bzltestutil.RegisterTimeoutHandler.func1"),
 		goleak.IgnoreTopFunction("github.com/lestrrat-go/httprc.runFetchWorker"),
 		goleak.IgnoreTopFunction("go.etcd.io/etcd/client/pkg/v3/logutil.(*MergeLogger).outputLoop"),
 	}
@@ -79,7 +81,7 @@ func TestStoreGlobalConfig(t *testing.T) {
 		err := store.Close()
 		require.NoError(t, err)
 	}()
-	session.SetSchemaLease(50 * time.Millisecond)
+	vardef.SetSchemaLease(50 * time.Millisecond)
 	domain, err := session.BootstrapSession(store)
 	require.NoError(t, err)
 	defer domain.Close()
@@ -91,7 +93,7 @@ func TestStoreGlobalConfig(t *testing.T) {
 	require.NoError(t, err)
 	_, err = se.Execute(context.Background(), "set @@global.tidb_source_id=2;")
 	require.NoError(t, err)
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		time.Sleep(100 * time.Millisecond)
 		client :=
 			store.(kv.StorageWithPD).GetPDClient()

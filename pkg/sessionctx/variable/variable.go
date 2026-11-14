@@ -23,100 +23,286 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/types"
 	"golang.org/x/exp/maps"
 )
 
-// ScopeFlag is for system variable whether can be changed in global/session dynamically or not.
-type ScopeFlag uint8
+// MViewExecutionSessionVars captures the execution-scoped session variables shared by MV build,
+// refresh, and mvservice maintenance orchestration.
+type MViewExecutionSessionVars struct {
+	MaintainMemQuota             int64
+	IsolationReadEngines         string
+	TiFlashMaxThreads            int64
+	TiFlashMaxBytesBeforeExtJoin int64
+	TiFlashMaxBytesBeforeExtAgg  int64
+	TiFlashMaxBytesBeforeExtSort int64
+	TiFlashMemQuotaQueryPerNode  int64
+	TiFlashQuerySpillRatio       float64
+	FineGrainedStreamCount       int64
+	FineGrainedBatchSize         uint64
+	ImportThreads                int
+	ImportDiskQuota              string
+	TrackAggregateMemoryUsage    bool
+	EnableParallelHashaggSpill   bool
+}
 
-// TypeFlag is the SysVar type, which doesn't exactly match MySQL types.
-type TypeFlag byte
+// MViewExecutionSessionVarsApplyConfig describes how MV execution vars should be applied onto a
+// session. The caller chooses which mem-quota sysvar should receive MaintainMemQuota and how apply
+// / restore errors should be reported.
+type MViewExecutionSessionVarsApplyConfig struct {
+	MaintainMemQuotaVarName             string
+	MaintainIsolationReadEnginesVarName string
+	CaptureAppliedVars                  func(*SessionVars) MViewExecutionSessionVars
+	BestEffort                          bool
+	InjectApplyError                    func(string) error
+	OnApplyError                        func(name, value string, err error)
+	OnRestoreError                      func(name, originValue, currentValue string, err error)
+}
 
-const (
-	// ScopeNone means the system variable can not be changed dynamically.
-	ScopeNone ScopeFlag = 0
-	// ScopeGlobal means the system variable can be changed globally.
-	ScopeGlobal ScopeFlag = 1 << 0
-	// ScopeSession means the system variable can only be changed in current session.
-	ScopeSession ScopeFlag = 1 << 1
-	// ScopeInstance means it is similar to global but doesn't propagate to other TiDB servers.
-	ScopeInstance ScopeFlag = 1 << 2
+type mViewExecutionSessionVarAssignment struct {
+	name           string
+	value          string
+	failureMessage string
+}
 
-	// TypeStr is the default
-	TypeStr TypeFlag = iota
-	// TypeBool for boolean
-	TypeBool
-	// TypeInt for integer
-	TypeInt
-	// TypeEnum for Enum
-	TypeEnum
-	// TypeFloat for Double
-	TypeFloat
-	// TypeUnsigned for Unsigned integer
-	TypeUnsigned
-	// TypeTime for time of day (a TiDB extension)
-	TypeTime
-	// TypeDuration for a golang duration (a TiDB extension)
-	TypeDuration
-
-	// On is the canonical string for ON
-	On = "ON"
-	// Off is the canonical string for OFF
-	Off = "OFF"
-	// Warn means return warnings
-	Warn = "WARN"
-	// IntOnly means enable for int type
-	IntOnly = "INT_ONLY"
-
-	// AssertionStrictStr is a choice of variable TiDBTxnAssertionLevel that means full assertions should be performed,
-	// even if the performance might be slowed down.
-	AssertionStrictStr = "STRICT"
-	// AssertionFastStr is a choice of variable TiDBTxnAssertionLevel that means assertions that doesn't affect
-	// performance should be performed.
-	AssertionFastStr = "FAST"
-	// AssertionOffStr is a choice of variable TiDBTxnAssertionLevel that means no assertion should be performed.
-	AssertionOffStr = "OFF"
-	// OOMActionCancel constants represents the valid action configurations for OOMAction "CANCEL".
-	OOMActionCancel = "CANCEL"
-	// OOMActionLog constants represents the valid action configurations for OOMAction "LOG".
-	OOMActionLog = "LOG"
-)
-
-// Global config name list.
-const (
-	GlobalConfigEnableTopSQL = "enable_resource_metering"
-	GlobalConfigSourceID     = "source_id"
-)
-
-func (s ScopeFlag) String() string {
-	var scopes []string
-	if s == ScopeNone {
-		return "NONE"
+// CaptureMViewExecutionSessionVars captures the user-facing MV execution knobs that should be
+// inherited by a later MV build/refresh job.
+func CaptureMViewExecutionSessionVars(sessVars *SessionVars) MViewExecutionSessionVars {
+	if sessVars == nil {
+		return MViewExecutionSessionVars{}
 	}
-	if s&ScopeSession != 0 {
-		scopes = append(scopes, "SESSION")
+	return MViewExecutionSessionVars{
+		MaintainMemQuota:             sessVars.MViewMaintainMemQuota,
+		IsolationReadEngines:         sessVars.MViewMaintainIsolationReadEngines,
+		TiFlashMaxThreads:            sessVars.TiFlashMaxThreads,
+		TiFlashMaxBytesBeforeExtJoin: sessVars.TiFlashMaxBytesBeforeExternalJoin,
+		TiFlashMaxBytesBeforeExtAgg:  sessVars.TiFlashMaxBytesBeforeExternalGroupBy,
+		TiFlashMaxBytesBeforeExtSort: sessVars.TiFlashMaxBytesBeforeExternalSort,
+		TiFlashMemQuotaQueryPerNode:  sessVars.TiFlashMaxQueryMemoryPerNode,
+		TiFlashQuerySpillRatio:       sessVars.TiFlashQuerySpillRatio,
+		FineGrainedStreamCount:       sessVars.TiFlashFineGrainedShuffleStreamCount,
+		FineGrainedBatchSize:         sessVars.TiFlashFineGrainedShuffleBatchSize,
+		ImportThreads:                sessVars.MViewMaintainImportThreads,
+		ImportDiskQuota:              sessVars.MViewMaintainImportDiskQuota,
+		TrackAggregateMemoryUsage:    sessVars.TrackAggregateMemoryUsage,
+		EnableParallelHashaggSpill:   sessVars.EnableParallelHashaggSpill,
 	}
-	if s&ScopeGlobal != 0 {
-		scopes = append(scopes, "GLOBAL")
+}
+
+// CaptureAppliedMViewExecutionSessionVars captures the execution-related values that are currently
+// in effect on a session after MV execution vars have been applied to tidb_mem_quota_query and
+// tidb_isolation_read_engines.
+func CaptureAppliedMViewExecutionSessionVars(sessVars *SessionVars) MViewExecutionSessionVars {
+	if sessVars == nil {
+		return MViewExecutionSessionVars{}
 	}
-	if s&ScopeInstance != 0 {
-		scopes = append(scopes, "INSTANCE")
+	return MViewExecutionSessionVars{
+		MaintainMemQuota:             sessVars.MemQuotaQuery,
+		IsolationReadEngines:         GetIsolationReadEnginesString(sessVars),
+		TiFlashMaxThreads:            sessVars.TiFlashMaxThreads,
+		TiFlashMaxBytesBeforeExtJoin: sessVars.TiFlashMaxBytesBeforeExternalJoin,
+		TiFlashMaxBytesBeforeExtAgg:  sessVars.TiFlashMaxBytesBeforeExternalGroupBy,
+		TiFlashMaxBytesBeforeExtSort: sessVars.TiFlashMaxBytesBeforeExternalSort,
+		TiFlashMemQuotaQueryPerNode:  sessVars.TiFlashMaxQueryMemoryPerNode,
+		TiFlashQuerySpillRatio:       sessVars.TiFlashQuerySpillRatio,
+		FineGrainedStreamCount:       sessVars.TiFlashFineGrainedShuffleStreamCount,
+		FineGrainedBatchSize:         sessVars.TiFlashFineGrainedShuffleBatchSize,
+		ImportThreads:                sessVars.MViewMaintainImportThreads,
+		ImportDiskQuota:              sessVars.MViewMaintainImportDiskQuota,
+		TrackAggregateMemoryUsage:    sessVars.TrackAggregateMemoryUsage,
+		EnableParallelHashaggSpill:   sessVars.EnableParallelHashaggSpill,
 	}
-	return strings.Join(scopes, ",")
+}
+
+// GetIsolationReadEnginesString returns the current session string value of
+// tidb_isolation_read_engines, or its default when the session has not loaded it yet.
+func GetIsolationReadEnginesString(sessVars *SessionVars) string {
+	if sessVars != nil {
+		if val, ok := sessVars.GetSystemVar(vardef.TiDBIsolationReadEngines); ok {
+			return val
+		}
+	}
+	if sv := GetSysVar(vardef.TiDBIsolationReadEngines); sv != nil {
+		return sv.Value
+	}
+	return ""
+}
+
+// ApplyMViewExecutionSessionVarsWithConfig applies MV execution vars onto a session and returns a
+// restore closure. In best-effort mode, individual apply failures fall back to the session's
+// current value for that variable while keeping successfully applied variables in effect.
+func ApplyMViewExecutionSessionVarsWithConfig(
+	sessVars *SessionVars,
+	target MViewExecutionSessionVars,
+	cfg MViewExecutionSessionVarsApplyConfig,
+) (func(), error) {
+	if sessVars == nil {
+		return nil, errors.New("mv execution: session vars is nil")
+	}
+
+	captureApplied := cfg.CaptureAppliedVars
+	if captureApplied == nil {
+		captureApplied = CaptureMViewExecutionSessionVars
+	}
+	maintainMemQuotaVarName := cfg.MaintainMemQuotaVarName
+	if maintainMemQuotaVarName == "" {
+		maintainMemQuotaVarName = vardef.TiDBMViewMaintainMemQuota
+	}
+	maintainIsolationReadEnginesVarName := cfg.MaintainIsolationReadEnginesVarName
+	if maintainIsolationReadEnginesVarName == "" {
+		maintainIsolationReadEnginesVarName = vardef.TiDBMViewMaintainIsolationReadEngines
+	}
+
+	// Always call SetSystemVar to synchronize the session-variable cache used by
+	// EncodeStates, even when the fields already match.
+	origin := captureApplied(sessVars)
+	for _, assignment := range buildMViewExecutionSessionVarAssignments(target, maintainMemQuotaVarName, maintainIsolationReadEnginesVarName) {
+		err := error(nil)
+		if cfg.InjectApplyError != nil {
+			err = cfg.InjectApplyError(assignment.name)
+		}
+		if err == nil {
+			err = sessVars.SetSystemVar(assignment.name, assignment.value)
+		}
+		if err == nil {
+			continue
+		}
+		if !cfg.BestEffort {
+			restoreMViewExecutionSessionVars(
+				sessVars,
+				origin,
+				captureApplied(sessVars),
+				maintainMemQuotaVarName,
+				maintainIsolationReadEnginesVarName,
+				cfg.OnRestoreError,
+			)
+			return nil, errors.Annotate(err, assignment.failureMessage)
+		}
+		if cfg.OnApplyError != nil {
+			cfg.OnApplyError(assignment.name, assignment.value, err)
+		}
+	}
+
+	applied := captureApplied(sessVars)
+	return func() {
+		restoreMViewExecutionSessionVars(
+			sessVars,
+			origin,
+			applied,
+			maintainMemQuotaVarName,
+			maintainIsolationReadEnginesVarName,
+			cfg.OnRestoreError,
+		)
+	}, nil
+}
+
+func buildMViewExecutionSessionVarAssignments(
+	target MViewExecutionSessionVars,
+	maintainMemQuotaVarName string,
+	maintainIsolationReadEnginesVarName string,
+) []mViewExecutionSessionVarAssignment {
+	return []mViewExecutionSessionVarAssignment{
+		{
+			name:           maintainMemQuotaVarName,
+			value:          strconv.FormatInt(target.MaintainMemQuota, 10),
+			failureMessage: "mv execution: failed to apply maintain mem quota",
+		},
+		{
+			name:           maintainIsolationReadEnginesVarName,
+			value:          target.IsolationReadEngines,
+			failureMessage: "mv execution: failed to apply tidb_isolation_read_engines",
+		},
+		{
+			name:           vardef.TiDBMaxTiFlashThreads,
+			value:          strconv.FormatInt(target.TiFlashMaxThreads, 10),
+			failureMessage: "mv execution: failed to apply tidb_max_tiflash_threads",
+		},
+		{
+			name:           vardef.TiDBMaxBytesBeforeTiFlashExternalJoin,
+			value:          strconv.FormatInt(target.TiFlashMaxBytesBeforeExtJoin, 10),
+			failureMessage: "mv execution: failed to apply tidb_max_bytes_before_tiflash_external_join",
+		},
+		{
+			name:           vardef.TiDBMaxBytesBeforeTiFlashExternalGroupBy,
+			value:          strconv.FormatInt(target.TiFlashMaxBytesBeforeExtAgg, 10),
+			failureMessage: "mv execution: failed to apply tidb_max_bytes_before_tiflash_external_group_by",
+		},
+		{
+			name:           vardef.TiDBMaxBytesBeforeTiFlashExternalSort,
+			value:          strconv.FormatInt(target.TiFlashMaxBytesBeforeExtSort, 10),
+			failureMessage: "mv execution: failed to apply tidb_max_bytes_before_tiflash_external_sort",
+		},
+		{
+			name:           vardef.TiFlashMemQuotaQueryPerNode,
+			value:          strconv.FormatInt(target.TiFlashMemQuotaQueryPerNode, 10),
+			failureMessage: "mv execution: failed to apply tiflash_mem_quota_query_per_node",
+		},
+		{
+			name:           vardef.TiFlashQuerySpillRatio,
+			value:          strconv.FormatFloat(target.TiFlashQuerySpillRatio, 'f', -1, 64),
+			failureMessage: "mv execution: failed to apply tiflash_query_spill_ratio",
+		},
+		{
+			name:           vardef.TiFlashFineGrainedShuffleStreamCount,
+			value:          strconv.FormatInt(target.FineGrainedStreamCount, 10),
+			failureMessage: "mv execution: failed to apply tiflash_fine_grained_shuffle_stream_count",
+		},
+		{
+			name:           vardef.TiFlashFineGrainedShuffleBatchSize,
+			value:          strconv.FormatUint(target.FineGrainedBatchSize, 10),
+			failureMessage: "mv execution: failed to apply tiflash_fine_grained_shuffle_batch_size",
+		},
+		{
+			name:           vardef.TiDBMViewMaintainImportThreads,
+			value:          strconv.Itoa(target.ImportThreads),
+			failureMessage: "mv execution: failed to apply tidb_mview_maintain_import_threads",
+		},
+		{
+			name:           vardef.TiDBMViewMaintainImportDiskQuota,
+			value:          target.ImportDiskQuota,
+			failureMessage: "mv execution: failed to apply tidb_mview_maintain_import_disk_quota",
+		},
+		{
+			name:           vardef.TiDBTrackAggregateMemoryUsage,
+			value:          BoolToOnOff(target.TrackAggregateMemoryUsage),
+			failureMessage: "mv execution: failed to apply tidb_track_aggregate_memory_usage",
+		},
+		{
+			name:           vardef.TiDBEnableParallelHashaggSpill,
+			value:          BoolToOnOff(target.EnableParallelHashaggSpill),
+			failureMessage: "mv execution: failed to apply tidb_enable_parallel_hashagg_spill",
+		},
+	}
+}
+
+func restoreMViewExecutionSessionVars(
+	sessVars *SessionVars,
+	origin, current MViewExecutionSessionVars,
+	maintainMemQuotaVarName string,
+	maintainIsolationReadEnginesVarName string,
+	onRestoreError func(name, originValue, currentValue string, err error),
+) {
+	originAssignments := buildMViewExecutionSessionVarAssignments(origin, maintainMemQuotaVarName, maintainIsolationReadEnginesVarName)
+	currentAssignments := buildMViewExecutionSessionVarAssignments(current, maintainMemQuotaVarName, maintainIsolationReadEnginesVarName)
+	for idx, assignment := range originAssignments {
+		if err := sessVars.SetSystemVar(assignment.name, assignment.value); err != nil && onRestoreError != nil {
+			onRestoreError(assignment.name, assignment.value, currentAssignments[idx].value, err)
+		}
+	}
 }
 
 // SysVar is for system variable.
 // All the fields of SysVar should be READ ONLY after created.
 type SysVar struct {
 	// Scope is for whether can be changed or not
-	Scope ScopeFlag
+	Scope vardef.ScopeFlag
 	// Name is the variable name.
 	Name string
 	// Value is the variable value.
 	Value string
 	// Type is the MySQL type (optional)
-	Type TypeFlag
+	Type vardef.TypeFlag
 	// MinValue will automatically be validated when specified (optional)
 	MinValue int64
 	// MaxValue will automatically be validated when specified (optional)
@@ -134,17 +320,20 @@ type SysVar struct {
 	// AllowAutoValue means that the special value "-1" is permitted, even when outside of range.
 	AllowAutoValue bool
 	// Validation is a callback after the type validation has been performed, but before the Set function
-	Validation func(*SessionVars, string, string, ScopeFlag) (string, error)
+	Validation func(*SessionVars, string, string, vardef.ScopeFlag) (string, error)
 	// SetSession is called after validation but before updating systems[]. It also doubles as an Init function
 	// and will be called on all variables in builtinGlobalVariable, regardless of their scope.
 	SetSession func(*SessionVars, string) error
 	// SetGlobal is called after validation
 	SetGlobal func(context.Context, *SessionVars, string) error
-	// IsHintUpdatableVerfied indicate whether we've confirmed that SET_VAR() hint is worked for this hint.
-	IsHintUpdatableVerfied bool
+	// IsHintUpdatableVerified indicate whether we've confirmed that SET_VAR() hint is worked for this hint.
+	IsHintUpdatableVerified bool
 	// Deprecated: Hidden previously meant that the variable still responds to SET but doesn't show up in SHOW VARIABLES
-	// However, this feature is no longer used. All variables are visble.
+	// However, this feature is no longer used. All variables are visible.
 	Hidden bool
+	// Some variables are semantically global or instance vars. But we need to set it as session scope to pass the value down
+	// to executor and planner. However, we don't want these variables visible or setable for users.
+	InternalSessionVariable bool
 	// Aliases is a list of sysvars that should also be updated when this sysvar is updated.
 	// Updating aliases calls the SET function of the aliases, but does not update their aliases (preventing SET recursion)
 	Aliases []string
@@ -155,6 +344,8 @@ type SysVar struct {
 	GetGlobal func(context.Context, *SessionVars) (string, error)
 	// GetStateValue gets the value for session states, which is used for migrating sessions.
 	// We need a function to override GetSession sometimes, because GetSession may not return the real value.
+	// The first return value must be a valid value for the variable, and the second return value must be
+	// true if and only if the variable has been changed from the default.
 	GetStateValue func(*SessionVars) (string, bool, error)
 	// Depended indicates whether other variables depend on this one. That is, if this one is not correctly set,
 	// another variable cannot be set either.
@@ -166,6 +357,12 @@ type SysVar struct {
 	skipInit bool
 	// IsNoop defines if the sysvar is a noop included for MySQL compatibility
 	IsNoop bool
+	// IsSensitive marks non-empty values that diagnostics must mask.
+	// Any variable containing secrets, whether built-in or extension-registered, must opt in.
+	// SQL getter semantics are unchanged.
+	IsSensitive bool
+	// IsInitedFromConfig defines if the sysvar is inited from the config file.
+	IsInitedFromConfig bool
 	// GlobalConfigName is the global config name of this global variable.
 	// If the global variable has the global config name,
 	// it should store the global config into PD(etcd) too when set global variable.
@@ -184,7 +381,7 @@ func (sv *SysVar) GetGlobalFromHook(ctx context.Context, s *SessionVars) (string
 		}
 		// Ensure that the results from the getter are validated
 		// Since some are read directly from tables.
-		return sv.ValidateWithRelaxedValidation(s, val, ScopeGlobal), nil
+		return sv.ValidateWithRelaxedValidation(s, val, vardef.ScopeGlobal), nil
 	}
 	if sv.HasNoneScope() {
 		return sv.Value, nil
@@ -205,15 +402,12 @@ func (sv *SysVar) GetSessionFromHook(s *SessionVars) (string, error) {
 		}
 		// Ensure that the results from the getter are validated
 		// Since some are read directly from tables.
-		return sv.ValidateWithRelaxedValidation(s, val, ScopeSession), nil
+		return sv.ValidateWithRelaxedValidation(s, val, vardef.ScopeSession), nil
 	}
 	var (
 		ok  bool
 		val string
 	)
-	if val, ok = s.stmtVars[sv.Name]; ok {
-		return val, nil
-	}
 	if val, ok = s.systems[sv.Name]; !ok {
 		return val, errors.New("sysvar has not yet loaded")
 	}
@@ -271,26 +465,26 @@ func (sv *SysVar) SetGlobalFromHook(ctx context.Context, s *SessionVars, val str
 
 // HasNoneScope returns true if the scope for the sysVar is None.
 func (sv *SysVar) HasNoneScope() bool {
-	return sv.Scope == ScopeNone
+	return sv.Scope == vardef.ScopeNone
 }
 
 // HasSessionScope returns true if the scope for the sysVar includes session.
 func (sv *SysVar) HasSessionScope() bool {
-	return sv.Scope&ScopeSession != 0
+	return sv.Scope&vardef.ScopeSession != 0
 }
 
 // HasGlobalScope returns true if the scope for the sysVar includes global.
 func (sv *SysVar) HasGlobalScope() bool {
-	return sv.Scope&ScopeGlobal != 0
+	return sv.Scope&vardef.ScopeGlobal != 0
 }
 
 // HasInstanceScope returns true if the scope for the sysVar includes instance
 func (sv *SysVar) HasInstanceScope() bool {
-	return sv.Scope&ScopeInstance != 0
+	return sv.Scope&vardef.ScopeInstance != 0
 }
 
 // Validate checks if system variable satisfies specific restriction.
-func (sv *SysVar) Validate(vars *SessionVars, value string, scope ScopeFlag) (string, error) {
+func (sv *SysVar) Validate(vars *SessionVars, value string, scope vardef.ScopeFlag) (string, error) {
 	// Check that the scope is correct first.
 	if err := sv.validateScope(scope); err != nil {
 		return value, err
@@ -309,42 +503,50 @@ func (sv *SysVar) Validate(vars *SessionVars, value string, scope ScopeFlag) (st
 }
 
 // ValidateFromType provides automatic validation based on the SysVar's type
-func (sv *SysVar) ValidateFromType(vars *SessionVars, value string, scope ScopeFlag) (string, error) {
+func (sv *SysVar) ValidateFromType(vars *SessionVars, value string, scope vardef.ScopeFlag) (string, error) {
 	// Some sysvars in TiDB have a special behavior where the empty string means
 	// "use the config file value". This needs to be cleaned up once the behavior
 	// for instance variables is determined.
-	if value == "" && ((sv.AllowEmpty && scope == ScopeSession) || sv.AllowEmptyAll) {
+	if value == "" && ((sv.AllowEmpty && scope == vardef.ScopeSession) || sv.AllowEmptyAll) {
 		return value, nil
 	}
 	// Provide validation using the SysVar struct
 	switch sv.Type {
-	case TypeUnsigned:
+	case vardef.TypeUnsigned:
 		return sv.checkUInt64SystemVar(value, vars)
-	case TypeInt:
+	case vardef.TypeInt:
 		return sv.checkInt64SystemVar(value, vars)
-	case TypeBool:
+	case vardef.TypeBool:
 		return sv.checkBoolSystemVar(value, vars)
-	case TypeFloat:
+	case vardef.TypeFloat:
 		return sv.checkFloatSystemVar(value, vars)
-	case TypeEnum:
+	case vardef.TypeEnum:
 		return sv.checkEnumSystemVar(value, vars)
-	case TypeTime:
+	case vardef.TypeTime:
 		return sv.checkTimeSystemVar(value, vars)
-	case TypeDuration:
+	case vardef.TypeDuration:
 		return sv.checkDurationSystemVar(value, vars)
 	}
 	return value, nil // typeString
 }
 
-func (sv *SysVar) validateScope(scope ScopeFlag) error {
-	if sv.ReadOnly || sv.Scope == ScopeNone {
+func (sv *SysVar) validateScope(scope vardef.ScopeFlag) error {
+	if sv.ReadOnly || sv.Scope == vardef.ScopeNone {
 		return ErrIncorrectScope.FastGenByArgs(sv.Name, "read only")
 	}
-	if scope == ScopeGlobal && !(sv.HasGlobalScope() || sv.HasInstanceScope()) {
+	if scope == vardef.ScopeGlobal && !(sv.HasGlobalScope() || sv.HasInstanceScope()) {
 		return errLocalVariable.FastGenByArgs(sv.Name)
 	}
-	if scope == ScopeSession && !sv.HasSessionScope() {
-		return errGlobalVariable.FastGenByArgs(sv.Name)
+	if scope == vardef.ScopeInstance && !sv.HasInstanceScope() {
+		return errLocalVariable.FastGenByArgs(sv.Name)
+	}
+	if scope == vardef.ScopeSession {
+		if !sv.HasSessionScope() {
+			return errGlobalVariable.FastGenByArgs(sv.Name)
+		}
+		if sv.InternalSessionVariable {
+			return errUnknownSystemVariable.GenWithStackByArgs(sv.Name)
+		}
 	}
 	return nil
 }
@@ -353,7 +555,7 @@ func (sv *SysVar) validateScope(scope ScopeFlag) error {
 // Normalization+validation needs to be applied when reading values because older versions of TiDB
 // may be less sophisticated in normalizing values. But errors should be caught and handled,
 // because otherwise there will be upgrade issues.
-func (sv *SysVar) ValidateWithRelaxedValidation(vars *SessionVars, value string, scope ScopeFlag) string {
+func (sv *SysVar) ValidateWithRelaxedValidation(vars *SessionVars, value string, scope vardef.ScopeFlag) string {
 	warns := vars.StmtCtx.GetWarnings()
 	defer func() {
 		vars.StmtCtx.SetWarnings(warns) // RelaxedValidation = trim warnings too.
@@ -371,19 +573,13 @@ func (sv *SysVar) ValidateWithRelaxedValidation(vars *SessionVars, value string,
 	return normalizedValue
 }
 
-const (
-	localDayTimeFormat = "15:04"
-	// FullDayTimeFormat is the full format of analyze start time and end time.
-	FullDayTimeFormat = "15:04 -0700"
-)
-
 func (sv *SysVar) checkTimeSystemVar(value string, vars *SessionVars) (string, error) {
 	var t time.Time
 	var err error
-	if len(value) <= len(localDayTimeFormat) {
-		t, err = time.ParseInLocation(localDayTimeFormat, value, vars.Location())
+	if len(value) <= len(vardef.LocalDayTimeFormat) {
+		t, err = time.ParseInLocation(vardef.LocalDayTimeFormat, value, vars.Location())
 	} else {
-		t, err = time.ParseInLocation(FullDayTimeFormat, value, vars.Location())
+		t, err = time.ParseInLocation(vardef.FullDayTimeFormat, value, vars.Location())
 	}
 	if err != nil {
 		return "", err
@@ -392,7 +588,7 @@ func (sv *SysVar) checkTimeSystemVar(value string, vars *SessionVars) (string, e
 	// For example, the Asia/Shanghai refers to +08:05 before 1900
 	now := time.Now()
 	t = time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
-	return t.Format(FullDayTimeFormat), nil
+	return t.Format(vardef.FullDayTimeFormat), nil
 }
 
 func (sv *SysVar) checkDurationSystemVar(value string, vars *SessionVars) (string, error) {
@@ -496,9 +692,9 @@ func (sv *SysVar) checkFloatSystemVar(value string, vars *SessionVars) (string, 
 
 func (sv *SysVar) checkBoolSystemVar(value string, vars *SessionVars) (string, error) {
 	if strings.EqualFold(value, "ON") {
-		return On, nil
+		return vardef.On, nil
 	} else if strings.EqualFold(value, "OFF") {
-		return Off, nil
+		return vardef.Off, nil
 	}
 	val, err := strconv.ParseInt(value, 10, 64)
 	if err == nil {
@@ -507,15 +703,15 @@ func (sv *SysVar) checkBoolSystemVar(value string, vars *SessionVars) (string, e
 		// negative integer to 1.
 		if !sv.AutoConvertNegativeBool {
 			if val == 0 {
-				return Off, nil
+				return vardef.Off, nil
 			} else if val == 1 {
-				return On, nil
+				return vardef.On, nil
 			}
 		} else {
 			if val == 1 || val < 0 {
-				return On, nil
+				return vardef.On, nil
 			} else if val == 0 {
-				return Off, nil
+				return vardef.Off, nil
 			}
 		}
 	}
@@ -526,13 +722,13 @@ func (sv *SysVar) checkBoolSystemVar(value string, vars *SessionVars) (string, e
 // TODO: only return 3 types now, support others like DOUBLE, TIME later
 func (sv *SysVar) GetNativeValType(val string) (types.Datum, byte, uint) {
 	switch sv.Type {
-	case TypeUnsigned:
+	case vardef.TypeUnsigned:
 		u, err := strconv.ParseUint(val, 10, 64)
 		if err != nil {
 			u = 0
 		}
 		return types.NewUintDatum(u), mysql.TypeLonglong, mysql.UnsignedFlag | mysql.BinaryFlag
-	case TypeBool:
+	case vardef.TypeBool:
 		optVal := int64(0) // OFF
 		if TiDBOptOn(val) {
 			optVal = 1
@@ -552,7 +748,7 @@ func (sv *SysVar) SkipInit() bool {
 }
 
 // SkipSysvarCache returns true if the sysvar should not re-execute on peers
-// This doesn't make sense for the GC variables because they are based in tikv
+// NOTE: This doesn't make sense for the GC variables because they are based in tikv
 // tables. We'd effectively be reading and writing to the same table, which
 // could be in an unsafe manner. In future these variables might be converted
 // to not use a different table internally, but to do that we need to first
@@ -560,8 +756,8 @@ func (sv *SysVar) SkipInit() bool {
 // which update only these values.
 func (sv *SysVar) SkipSysvarCache() bool {
 	switch sv.Name {
-	case TiDBGCEnable, TiDBGCRunInterval, TiDBGCLifetime,
-		TiDBGCConcurrency, TiDBGCScanLockMode, TiDBExternalTS:
+	case vardef.TiDBGCEnable, vardef.TiDBGCRunInterval, vardef.TiDBGCLifetime,
+		vardef.TiDBGCConcurrency, vardef.TiDBGCScanLockMode, vardef.TiDBExternalTS:
 		return true
 	}
 	return false
@@ -655,6 +851,8 @@ type GlobalVarAccessor interface {
 	GetGlobalSysVar(name string) (string, error)
 	// SetGlobalSysVar sets the global system variable name to value.
 	SetGlobalSysVar(ctx context.Context, name string, value string) error
+	// SetInstanceSysVar sets the instance system variable name to value.
+	SetInstanceSysVar(ctx context.Context, name string, value string) error
 	// SetGlobalSysVarOnly sets the global system variable without calling the validation function or updating aliases.
 	SetGlobalSysVarOnly(ctx context.Context, name string, value string, updateLocal bool) error
 	// GetTiDBTableValue gets a value from mysql.tidb for the key 'name'

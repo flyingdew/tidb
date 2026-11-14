@@ -16,7 +16,6 @@ package executor
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -28,6 +27,7 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/executor/internal/exec"
 	"github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/util/chunk"
@@ -37,6 +37,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/memory"
 	"github.com/pingcap/tidb/pkg/util/size"
 	clientutil "github.com/tikv/client-go/v2/util"
+	rmclient "github.com/tikv/pd/client/resource_group/controller"
 	"go.uber.org/zap"
 )
 
@@ -53,7 +54,7 @@ type ExplainExec struct {
 
 // Open implements the Executor Open interface.
 func (e *ExplainExec) Open(ctx context.Context) error {
-	if e.analyzeExec != nil {
+	if e.explain.Analyze && e.analyzeExec != nil {
 		return exec.Open(ctx, e.analyzeExec)
 	}
 	return nil
@@ -62,7 +63,7 @@ func (e *ExplainExec) Open(ctx context.Context) error {
 // Close implements the Executor Close interface.
 func (e *ExplainExec) Close() error {
 	e.rows = nil
-	if e.analyzeExec != nil && !e.executed {
+	if e.explain.Analyze && e.analyzeExec != nil && !e.executed {
 		// Open(), but Next() is not called.
 		return exec.Close(e.analyzeExec)
 	}
@@ -95,8 +96,13 @@ func (e *ExplainExec) Next(ctx context.Context, req *chunk.Chunk) error {
 }
 
 func (e *ExplainExec) executeAnalyzeExec(ctx context.Context) (err error) {
-	if e.analyzeExec != nil && !e.executed {
-		defer func() {
+	if e.explain.Analyze && e.analyzeExec != nil && !e.executed {
+		closed := false
+		closeAnalyzeExec := func() {
+			if closed {
+				return
+			}
+			closed = true
 			err1 := exec.Close(e.analyzeExec)
 			if err1 != nil {
 				if err != nil {
@@ -105,7 +111,8 @@ func (e *ExplainExec) executeAnalyzeExec(ctx context.Context) (err error) {
 					err = err1
 				}
 			}
-		}()
+		}
+		defer closeAnalyzeExec()
 		if minHeapInUse, alarmRatio := e.Ctx().GetSessionVars().MemoryDebugModeMinHeapInUse, e.Ctx().GetSessionVars().MemoryDebugModeAlarmRatio; minHeapInUse != 0 && alarmRatio != 0 {
 			memoryDebugModeCtx, cancel := context.WithCancel(ctx)
 			waitGroup := sync.WaitGroup{}
@@ -132,21 +139,82 @@ func (e *ExplainExec) executeAnalyzeExec(ctx context.Context) (err error) {
 				break
 			}
 		}
+		if e.explain.Format == "ru" {
+			// Close waits for producers and collects unconsumed request statistics.
+			// The RU snapshot must include all work published during teardown.
+			closeAnalyzeExec()
+		}
 	}
 	// Register the RU runtime stats to the runtime stats collection after the analyze executor has been executed.
-	if e.analyzeExec != nil && e.executed {
+	if e.explain.Analyze && e.analyzeExec != nil && e.executed {
 		ruDetailsRaw := ctx.Value(clientutil.RUDetailsCtxKey)
-		if coll := e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl; coll != nil && ruDetailsRaw != nil {
-			ruDetails := ruDetailsRaw.(*clientutil.RUDetails)
-			coll.RegisterStats(e.explain.TargetPlan.ID(), &ruRuntimeStats{ruDetails})
+		if coll := e.Ctx().GetSessionVars().StmtCtx.RuntimeStatsColl; coll != nil {
+			var ruDetails *clientutil.RUDetails
+			if ruDetailsRaw != nil {
+				ruDetails = ruDetailsRaw.(*clientutil.RUDetails).Clone()
+			}
+			ruv2Metrics := execdetails.SyncRUV2MetricsFromContext(ctx)
+			if ruDetails != nil {
+				ruVersion := rmclient.DefaultRUVersion
+				if do := domain.GetDomain(e.Ctx()); do != nil {
+					ruVersion = do.GetRUVersion()
+				}
+				if ruVersion != rmclient.RUVersionV2 {
+					coll.RegisterStats(e.explain.TargetPlan.ID(), &execdetails.RURuntimeStats{RUDetails: ruDetails})
+				}
+			}
+			e.registerExplainRUOperatorStats(coll, ruv2Metrics, err == nil)
 		}
 	}
 	return err
 }
 
+func (e *ExplainExec) registerExplainRUOperatorStats(
+	coll *execdetails.RuntimeStatsColl,
+	metrics *execdetails.RUV2Metrics,
+	rootEOF bool,
+) {
+	if e.explain == nil || e.explain.Format != "ru" {
+		return
+	}
+	// An Explain may be rendered again after execution. Clear a prior snapshot
+	// before recalculating so a new fail-closed result cannot expose stale RU.
+	e.explain.SetRUResult(nil)
+	if coll == nil {
+		return
+	}
+	writes := snapshotStatementRUWrites(e.Ctx().GetSessionVars().StmtCtx.GetExecDetails().CommitDetail)
+	flat := core.FlattenPhysicalPlan(e.explain.TargetPlan, true)
+	setup := statementRUCalculationSetup{}
+	if e.explain.ExecStmt != nil {
+		setup.frontendCompileBytes = statementRUFrontendCompileBytes(&ExecStmt{
+			Ctx:      e.Ctx(),
+			Plan:     e.explain.TargetPlan,
+			StmtNode: e.explain.ExecStmt,
+		})
+	}
+	_, result, ok := calculateStatementRUWithOperators(
+		flat,
+		coll,
+		metrics,
+		writes,
+		setup,
+		rootEOF,
+	)
+	if !ok {
+		return
+	}
+	// The finalized result is aligned by forest/tree/operator coordinates.
+	// Plan.ID remains only an evidence lookup key, so a shallow-copied CTE
+	// definition or scalar occurrence cannot overwrite another display row.
+	e.explain.SetRUResult(result)
+}
+
 func (e *ExplainExec) generateExplainInfo(ctx context.Context) (rows [][]string, err error) {
-	if err = e.executeAnalyzeExec(ctx); err != nil {
-		return nil, err
+	if e.explain.Analyze {
+		if err = e.executeAnalyzeExec(ctx); err != nil {
+			return nil, err
+		}
 	}
 	if err = e.explain.RenderResult(); err != nil {
 		return nil, err
@@ -160,9 +228,19 @@ func (e *ExplainExec) generateExplainInfo(ctx context.Context) (rows [][]string,
 // Otherwise, in autocommit transaction, the table record change of analyze executor(insert/update/delete...)
 // will not be committed.
 func (e *ExplainExec) getAnalyzeExecToExecutedNoDelay() exec.Executor {
-	if e.analyzeExec != nil && !e.executed && e.analyzeExec.Schema().Len() == 0 {
+	if e.explain.Analyze && e.analyzeExec != nil && !e.executed && e.analyzeExec.Schema().Len() == 0 {
 		e.executed = true
 		return e.analyzeExec
+	}
+	return nil
+}
+
+func (e *ExplainExec) getAnalyzeExecWithForeignKeyTrigger() WithForeignKeyTrigger {
+	if e.explain.Analyze && e.analyzeExec != nil {
+		exec, ok := e.analyzeExec.(WithForeignKeyTrigger)
+		if ok {
+			return exec
+		}
 	}
 	return nil
 }
@@ -315,39 +393,4 @@ func getHeapProfile() (fileName string, err error) {
 		return "", err
 	}
 	return fileName, nil
-}
-
-// ruRuntimeStats is a wrapper of clientutil.RUDetails,
-// which implements the RuntimeStats interface.
-type ruRuntimeStats struct {
-	*clientutil.RUDetails
-}
-
-// String implements the RuntimeStats interface.
-func (e *ruRuntimeStats) String() string {
-	if e.RUDetails != nil {
-		return fmt.Sprintf("RU:%f", e.RRU()+e.WRU())
-	}
-	return ""
-}
-
-// Clone implements the RuntimeStats interface.
-func (e *ruRuntimeStats) Clone() execdetails.RuntimeStats {
-	return &ruRuntimeStats{RUDetails: e.RUDetails.Clone()}
-}
-
-// Merge implements the RuntimeStats interface.
-func (e *ruRuntimeStats) Merge(other execdetails.RuntimeStats) {
-	if tmp, ok := other.(*ruRuntimeStats); ok {
-		if e.RUDetails != nil {
-			e.RUDetails.Merge(tmp.RUDetails)
-		} else {
-			e.RUDetails = tmp.RUDetails.Clone()
-		}
-	}
-}
-
-// Tp implements the RuntimeStats interface.
-func (*ruRuntimeStats) Tp() int {
-	return execdetails.TpRURuntimeStats
 }

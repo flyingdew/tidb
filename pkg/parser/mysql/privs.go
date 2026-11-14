@@ -13,6 +13,8 @@
 
 package mysql
 
+import "slices"
+
 // AllPrivilegeLiteral is the string literal for All Privilege.
 const AllPrivilegeLiteral = "ALL PRIVILEGES"
 
@@ -37,6 +39,7 @@ var Priv2Str = map[PrivilegeType]string{
 	IndexPriv:             "Index",
 	CreateViewPriv:        "Create View",
 	ShowViewPriv:          "Show View",
+	OperateViewPriv:       "Operate View",
 	CreateRolePriv:        "Create Role",
 	DropRolePriv:          "Drop Role",
 	CreateTMPTablePriv:    "CREATE TEMPORARY TABLES",
@@ -74,6 +77,7 @@ var Priv2SetStr = map[PrivilegeType]string{
 	IndexPriv:          "Index",
 	CreateViewPriv:     "Create View",
 	ShowViewPriv:       "Show View",
+	OperateViewPriv:    "Operate View",
 	CreateRolePriv:     "Create Role",
 	DropRolePriv:       "Drop Role",
 	ShutdownPriv:       "Shutdown Role",
@@ -100,6 +104,7 @@ var SetStr2Priv = map[string]PrivilegeType{
 	"Index":                   IndexPriv,
 	"Create View":             CreateViewPriv,
 	"Show View":               ShowViewPriv,
+	"Operate View":            OperateViewPriv,
 	"Trigger":                 TriggerPriv,
 }
 
@@ -124,6 +129,7 @@ var Priv2UserCol = map[PrivilegeType]string{
 	IndexPriv:             "Index_priv",
 	CreateViewPriv:        "Create_view_priv",
 	ShowViewPriv:          "Show_view_priv",
+	OperateViewPriv:       "Operate_view_priv",
 	CreateRolePriv:        "Create_role_priv",
 	DropRolePriv:          "Drop_role_priv",
 	CreateTMPTablePriv:    "Create_tmp_table_priv",
@@ -160,6 +166,7 @@ var Col2PrivType = map[string]PrivilegeType{
 	"Index_priv":             IndexPriv,
 	"Create_view_priv":       CreateViewPriv,
 	"Show_view_priv":         ShowViewPriv,
+	"Operate_view_priv":      OperateViewPriv,
 	"Create_role_priv":       CreateRolePriv,
 	"Drop_role_priv":         DropRolePriv,
 	"Create_tmp_table_priv":  CreateTMPTablePriv,
@@ -257,7 +264,7 @@ const (
 	CreateRolePriv
 	// DropRolePriv is the privilege to drop a role.
 	DropRolePriv
-	// CreateTMPTablePriv is the privilege to create a temporary table.
+	// CreateTMPTablePriv is the privilege to create a local temporary table.
 	CreateTMPTablePriv
 	// LockTablesPriv is the privilege to lock tables.
 	LockTablesPriv
@@ -285,6 +292,9 @@ const (
 	// ReplicationSlavePriv is used in MySQL replication
 	ReplicationSlavePriv
 
+	// OperateViewPriv is the privilege to operate materialized view maintenance.
+	OperateViewPriv
+
 	// AllPriv is the privilege for all actions.
 	AllPriv
 	/*
@@ -305,22 +315,17 @@ type Privileges []PrivilegeType
 
 // Has checks whether PrivilegeType has the privilege.
 func (privs Privileges) Has(p PrivilegeType) bool {
-	for _, cp := range privs {
-		if cp == p {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(privs, p)
 }
 
 // AllGlobalPrivs is all the privileges in global scope.
-var AllGlobalPrivs = Privileges{SelectPriv, InsertPriv, UpdatePriv, DeletePriv, CreatePriv, DropPriv, ProcessPriv, ReferencesPriv, AlterPriv, ShowDBPriv, SuperPriv, ExecutePriv, IndexPriv, CreateUserPriv, CreateTablespacePriv, TriggerPriv, CreateViewPriv, ShowViewPriv, CreateRolePriv, DropRolePriv, CreateTMPTablePriv, LockTablesPriv, CreateRoutinePriv, AlterRoutinePriv, EventPriv, ShutdownPriv, ReloadPriv, FilePriv, ConfigPriv, ReplicationClientPriv, ReplicationSlavePriv}
+var AllGlobalPrivs = Privileges{SelectPriv, InsertPriv, UpdatePriv, DeletePriv, CreatePriv, DropPriv, ProcessPriv, ReferencesPriv, AlterPriv, ShowDBPriv, SuperPriv, ExecutePriv, IndexPriv, CreateUserPriv, CreateTablespacePriv, TriggerPriv, CreateViewPriv, ShowViewPriv, OperateViewPriv, CreateRolePriv, DropRolePriv, CreateTMPTablePriv, LockTablesPriv, CreateRoutinePriv, AlterRoutinePriv, EventPriv, ShutdownPriv, ReloadPriv, FilePriv, ConfigPriv, ReplicationClientPriv, ReplicationSlavePriv}
 
 // AllDBPrivs is all the privileges in database scope.
-var AllDBPrivs = Privileges{SelectPriv, InsertPriv, UpdatePriv, DeletePriv, CreatePriv, DropPriv, ReferencesPriv, LockTablesPriv, CreateTMPTablePriv, EventPriv, CreateRoutinePriv, AlterRoutinePriv, AlterPriv, ExecutePriv, IndexPriv, CreateViewPriv, ShowViewPriv, TriggerPriv}
+var AllDBPrivs = Privileges{SelectPriv, InsertPriv, UpdatePriv, DeletePriv, CreatePriv, DropPriv, ReferencesPriv, LockTablesPriv, CreateTMPTablePriv, EventPriv, CreateRoutinePriv, AlterRoutinePriv, AlterPriv, ExecutePriv, IndexPriv, CreateViewPriv, ShowViewPriv, OperateViewPriv, TriggerPriv}
 
 // AllTablePrivs is all the privileges in table scope.
-var AllTablePrivs = Privileges{SelectPriv, InsertPriv, UpdatePriv, DeletePriv, CreatePriv, DropPriv, IndexPriv, ReferencesPriv, AlterPriv, CreateViewPriv, ShowViewPriv, TriggerPriv}
+var AllTablePrivs = Privileges{SelectPriv, InsertPriv, UpdatePriv, DeletePriv, CreatePriv, DropPriv, IndexPriv, ReferencesPriv, AlterPriv, CreateViewPriv, ShowViewPriv, OperateViewPriv, TriggerPriv}
 
 // AllColumnPrivs is all the privileges in column scope.
 var AllColumnPrivs = Privileges{SelectPriv, InsertPriv, UpdatePriv, ReferencesPriv}

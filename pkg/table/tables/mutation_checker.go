@@ -16,14 +16,14 @@ package tables
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/errno"
 	"github.com/pingcap/tidb/pkg/kv"
-	"github.com/pingcap/tidb/pkg/parser/model"
-	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/tablecodec"
@@ -74,17 +74,33 @@ type columnMaps struct {
 // The check is performed on almost every write. Its performance matters.
 // Let M = the number of mutations, C = the number of columns in the table,
 // I = the sum of the number of columns in all indices,
-// The time complexity is O(M * C + I)
-// The space complexity is O(M + C + I)
+// The time complexity is O(M * C + I), with one exception: a multi-valued index on an array of N
+// elements produces N mutations for a single row. Checking them costs O(N * log N) on the common path,
+// because the array elements are sorted and cached once per row and column, and every mutation is then
+// checked with a binary search. A binary-search miss falls back to the per-element scan, so the worst
+// case for such a row remains O(N^2).
+// The space complexity is O(M + C + I), plus O(N) for the cached elements of a multi-valued index.
 func CheckDataConsistency(
-	txn kv.Transaction, sessVars *variable.SessionVars, t *TableCommon,
+	txn kv.Transaction, tc types.Context, t *TableCommon,
 	rowToInsert, rowToRemove []types.Datum, memBuffer kv.MemBuffer, sh kv.StagingHandle,
 ) error {
+	return checkDataConsistency(txn, tc, t, rowToInsert, rowToRemove, memBuffer, sh, nil)
+}
+
+func checkDataConsistency(
+	txn kv.Transaction, tc types.Context, t *TableCommon,
+	rowToInsert, rowToRemove []types.Datum, memBuffer kv.MemBuffer, sh kv.StagingHandle,
+	extraIndexesLayout table.IndexesLayout,
+) error {
 	if t.Meta().GetPartitionInfo() != nil {
+		// TODO: Support check for partitions as well
+		return nil
+	}
+	if txn.IsPipelined() {
 		return nil
 	}
 	if sh == 0 {
-		// some implementations of MemBuffer doesn't support staging, e.g. that in br/pkg/lightning/backend/kv
+		// some implementations of MemBuffer doesn't support staging, e.g. that in pkg/lightning/backend/kv
 		return nil
 	}
 	indexMutations, rowInsertion, err := collectTableMutationsFromBufferStage(t, memBuffer, sh)
@@ -112,7 +128,7 @@ func CheckDataConsistency(
 	}
 
 	if err := checkIndexKeys(
-		sessVars, t, rowToInsert, rowToRemove, indexMutations, columnMaps.IndexIDToInfo, columnMaps.IndexIDToRowColInfos,
+		tc, t, rowToInsert, rowToRemove, indexMutations, columnMaps.IndexIDToInfo, columnMaps.IndexIDToRowColInfos, extraIndexesLayout,
 	); err != nil {
 		return errors.Trace(err)
 	}
@@ -202,11 +218,16 @@ func checkHandleConsistency(rowInsertion mutation, indexMutations []mutation, in
 // (a) {added indices} is a subset of {needed indices} => each index mutation is consistent with the input/row key/value
 // (b) {needed indices} is a subset of {added indices}. The check process would be exactly the same with how we generate the mutations, thus ignored.
 func checkIndexKeys(
-	sessVars *variable.SessionVars, t *TableCommon, rowToInsert, rowToRemove []types.Datum,
+	tc types.Context, t *TableCommon, rowToInsert, rowToRemove []types.Datum,
 	indexMutations []mutation, indexIDToInfo map[int64]*model.IndexInfo,
 	indexIDToRowColInfos map[int64][]rowcodec.ColInfo,
+	extraIndexesLayout table.IndexesLayout,
 ) error {
+	useNewCollate := t.encoder.UseNewCollate()
 	var indexData []types.Datum
+	// The caches are only used by multi-valued indexes, which are uncommon, so they are created lazily
+	// in the loop below. They are per-row and are keyed by the offset of the column in that row.
+	var insertMVElems, removeMVElems mvIndexSortedElems
 	for _, m := range indexMutations {
 		var value []byte
 		// Generate correct index id for check.
@@ -239,11 +260,12 @@ func checkIndexKeys(
 		}
 
 		// when we cannot decode the key to get the original value
-		if len(value) == 0 && NeedRestoredData(indexInfo.Columns, t.Meta().Columns) {
+		if len(value) == 0 && NeedRestoredData(useNewCollate, indexInfo.Columns, t.Meta().Columns) {
 			continue
 		}
 
-		decodedIndexValues, err := tablecodec.DecodeIndexKV(
+		decodedIndexValues, err := tablecodec.DecodeIndexKVWithCollate(
+			useNewCollate,
 			m.key, value, len(indexInfo.Columns), tablecodec.HandleNotNeeded, rowColInfos,
 		)
 		if err != nil {
@@ -257,9 +279,10 @@ func checkIndexKeys(
 			indexData = indexData[:0]
 		}
 
+		loc := tc.Location()
 		for i, v := range decodedIndexValues {
 			fieldType := t.Columns[indexInfo.Columns[i].Offset].FieldType.ArrayType()
-			datum, err := tablecodec.DecodeColumnValue(v, fieldType, sessVars.Location())
+			datum, err := tablecodec.DecodeColumnValue(v, fieldType, loc)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -267,11 +290,15 @@ func checkIndexKeys(
 		}
 
 		// When it is in add index new backfill state.
-		if len(value) == 0 || isTmpIdxValAndDeleted {
-			err = compareIndexData(sessVars.StmtCtx, t.Columns, indexData, rowToRemove, indexInfo, t.Meta())
-		} else {
-			err = compareIndexData(sessVars.StmtCtx, t.Columns, indexData, rowToInsert, indexInfo, t.Meta())
+		isRemove := len(value) == 0 || isTmpIdxValAndDeleted
+		input, mvElems := rowToInsert, &insertMVElems
+		if isRemove {
+			input, mvElems = rowToRemove, &removeMVElems
 		}
+		err = compareIndexDataWithMVCache(
+			useNewCollate, tc, t.Columns, indexData, input, indexInfo, t.Meta(),
+			extraIndexesLayout.GetIndexLayout(idxID), mvElems,
+		)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -350,35 +377,58 @@ func collectTableMutationsFromBufferStage(t *TableCommon, memBuffer kv.MemBuffer
 	return indexMutations, rowInsertion, err
 }
 
-// compareIndexData compares the decoded index data with the input data.
+// compareIndexDataWithMVCache compares the decoded index data with the input data.
 // Returns error if the index data is not a subset of the input data.
-func compareIndexData(
-	sc *stmtctx.StatementContext, cols []*table.Column, indexData, input []types.Datum, indexInfo *model.IndexInfo,
+// mvElems, when non-nil, carries the per-column caches of sorted array elements for a multi-valued
+// index. The cache is per-row and keyed by the offset of the column in that row, so it must never be
+// reused across rows. The map itself is allocated lazily, only when the check actually populates it.
+func compareIndexDataWithMVCache(
+	useNewCollate bool,
+	tc types.Context, cols []*table.Column, indexData, input []types.Datum, indexInfo *model.IndexInfo,
 	tableInfo *model.TableInfo,
+	extraIndexLayout table.IndexRowLayoutOption,
+	mvElems *mvIndexSortedElems,
 ) error {
 	for i := range indexData {
+		offsetInRow := indexInfo.Columns[i].Offset
+		if len(extraIndexLayout) > 0 {
+			offsetInRow = extraIndexLayout[i]
+		}
+		offsetInTable := indexInfo.Columns[i].Offset
 		decodedMutationDatum := indexData[i]
-		expectedDatum := input[indexInfo.Columns[i].Offset]
+		expectedDatum := input[offsetInRow]
 
 		tablecodec.TruncateIndexValue(
 			&expectedDatum, indexInfo.Columns[i],
-			cols[indexInfo.Columns[i].Offset].ColumnInfo,
+			cols[offsetInTable].ColumnInfo,
 		)
 		tablecodec.TruncateIndexValue(
 			&decodedMutationDatum, indexInfo.Columns[i],
-			cols[indexInfo.Columns[i].Offset].ColumnInfo,
+			cols[offsetInTable].ColumnInfo,
 		)
 
-		comparison, err := CompareIndexAndVal(sc, expectedDatum, decodedMutationDatum,
-			collate.GetCollator(decodedMutationDatum.Collation()),
-			cols[indexInfo.Columns[i].Offset].ColumnInfo.FieldType.IsArray() && expectedDatum.Kind() == types.KindMysqlJSON)
+		var comparison int
+		var err error
+		// Only real multi-valued index columns need the containment semantics. The condition keeps
+		// the previous behavior, and the cache is used on top of it.
+		cmpMVIndex := cols[offsetInTable].ColumnInfo.FieldType.IsArray() &&
+			expectedDatum.Kind() == types.KindMysqlJSON
+		if cmpMVIndex && indexInfo.MVIndex {
+			comparison, err = compareMVIndexVal(
+				tc, &expectedDatum, &decodedMutationDatum, offsetInRow, mvElems)
+		} else {
+			comparison, err = CompareIndexAndVal(
+				tc, expectedDatum, decodedMutationDatum,
+				collate.GetCollatorWithCollate(useNewCollate, decodedMutationDatum.Collation()),
+				cmpMVIndex)
+		}
 		if err != nil {
 			return errors.Trace(err)
 		}
 
 		if comparison != 0 {
 			err = ErrInconsistentIndexedValue.GenWithStackByArgs(
-				tableInfo.Name.O, indexInfo.Name.O, cols[indexInfo.Columns[i].Offset].ColumnInfo.Name.O,
+				tableInfo.Name.O, indexInfo.Name.O, cols[offsetInTable].ColumnInfo.Name.O,
 				decodedMutationDatum.String(), expectedDatum.String(),
 			)
 			logutil.BgLogger().Error("inconsistent indexed value in index insertion", zap.Error(err))
@@ -388,26 +438,100 @@ func compareIndexData(
 	return nil
 }
 
+// mvIndexSortedElems caches the sorted array elements of a row, keyed by the offset of the column
+// in that row. It is only used for multi-valued indexes.
+type mvIndexSortedElems map[int][]types.BinaryJSON
+
+// compareMVIndexVal checks that the indexed value of one element of a multi-valued index exists in
+// the row's array. When mvElems is nil it falls back to the per-element scan. Otherwise the sorted
+// elements of the row are cached on first use, and every later mutation of the same column is checked
+// with a binary search. Both paths use the same comparison, so a binary-search hit can never be a
+// false positive; a miss is re-checked by the fallback to stay conservative.
+func compareMVIndexVal(
+	tc types.Context, rowVal, idxVal *types.Datum, offsetInRow int, mvElems *mvIndexSortedElems,
+) (int, error) {
+	if mvElems == nil {
+		return CompareIndexAndVal(tc, *rowVal, *idxVal, collate.GetBinaryCollator(), true)
+	}
+	bj := rowVal.GetMysqlJSON()
+	count := bj.GetElemCount()
+	// An empty array contains nothing, and the per-element scan returns 0 without iterating.
+	if count == 0 {
+		return 0, nil
+	}
+	// A NULL index value never matches an element, for the reasons explained in CompareIndexAndVal.
+	if idxVal.IsNull() {
+		return -1, nil
+	}
+	idxJSON, err := idxVal.ToMysqlJSON()
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	sorted, ok := (*mvElems)[offsetInRow]
+	if !ok {
+		sorted = sortedJSONArrayElems(bj)
+		// Allocate the cache lazily, so that a multi-valued index whose column is not reached
+		// (for example a NULL row value) does not pay for the allocation.
+		if *mvElems == nil {
+			*mvElems = make(mvIndexSortedElems)
+		}
+		(*mvElems)[offsetInRow] = sorted
+	}
+	if _, found := slices.BinarySearchFunc(sorted, idxJSON, types.CompareBinaryJSON); found {
+		return 0, nil
+	}
+	// A miss usually means the value is really absent, but re-check with the per-element scan before
+	// reporting an inconsistency: CompareBinaryJSON is not a strict weak ordering (its mixed float
+	// and integer comparisons use an absolute epsilon, so equality is not transitive), which puts
+	// the sortedness of the slice and the binary-search result on unspecified footing. The scan
+	// compares every element pairwise and is the authoritative verdict.
+	return CompareIndexAndVal(tc, *rowVal, *idxVal, collate.GetBinaryCollator(), true)
+}
+
+// sortedJSONArrayElems copies the elements of a JSON array and sorts them by CompareBinaryJSON.
+func sortedJSONArrayElems(bj types.BinaryJSON) []types.BinaryJSON {
+	count := bj.GetElemCount()
+	elems := make([]types.BinaryJSON, 0, count)
+	for elemIdx := range count {
+		elems = append(elems, bj.ArrayGetElem(elemIdx))
+	}
+	slices.SortFunc(elems, types.CompareBinaryJSON)
+	return elems
+}
+
 // CompareIndexAndVal compare index valued and row value.
-func CompareIndexAndVal(sctx *stmtctx.StatementContext, rowVal types.Datum, idxVal types.Datum, collator collate.Collator, cmpMVIndex bool) (int, error) {
+func CompareIndexAndVal(tc types.Context, rowVal types.Datum, idxVal types.Datum, collator collate.Collator, cmpMVIndex bool) (int, error) {
 	var cmpRes int
 	var err error
 	if cmpMVIndex {
 		// If it is multi-valued index, we should check the JSON contains the indexed value.
 		bj := rowVal.GetMysqlJSON()
 		count := bj.GetElemCount()
-		for elemIdx := 0; elemIdx < count; elemIdx++ {
-			jsonDatum := types.NewJSONDatum(bj.ArrayGetElem(elemIdx))
-			cmpRes, err = jsonDatum.Compare(sctx.TypeCtx(), &idxVal, collate.GetBinaryCollator())
-			if err != nil {
-				return 0, errors.Trace(err)
-			}
+		if count == 0 {
+			// The loop below would not run, so the result stays 0.
+			return 0, nil
+		}
+		if idxVal.IsNull() {
+			// The write path only produces a NULL index value when the column itself is NULL, and a
+			// NULL column never takes this path (the callers require a JSON row value). JSON null
+			// array elements are impossible too, because CAST(... AS <type> ARRAY) rejects them.
+			// So a NULL index value is a mismatch.
+			return -1, nil
+		}
+		// Convert the indexed value to JSON once instead of once per array element.
+		var idxJSON types.BinaryJSON
+		idxJSON, err = idxVal.ToMysqlJSON()
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		for elemIdx := range count {
+			cmpRes = types.CompareBinaryJSON(bj.ArrayGetElem(elemIdx), idxJSON)
 			if cmpRes == 0 {
 				break
 			}
 		}
 	} else {
-		cmpRes, err = idxVal.Compare(sctx.TypeCtx(), &rowVal, collator)
+		cmpRes, err = idxVal.Compare(tc, &rowVal, collator)
 	}
 	return cmpRes, err
 }

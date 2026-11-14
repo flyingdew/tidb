@@ -18,11 +18,13 @@ import (
 	"fmt"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/charset"
-	"github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/util"
+	parserutil "github.com/pingcap/tidb/pkg/util/parser"
 )
 
 // nameResolver is the visitor to resolve table name and column name.
@@ -32,29 +34,25 @@ type nameResolver struct {
 	err       error
 }
 
-// Enter implements ast.Visitor interface.
-func (*nameResolver) Enter(inNode ast.Node) (ast.Node, bool) {
-	return inNode, false
+// Enter implements ast.InPlaceVisitor interface.
+func (*nameResolver) Enter(ast.Node) bool {
+	return false
 }
 
-// Leave implements ast.Visitor interface.
-func (nr *nameResolver) Leave(inNode ast.Node) (node ast.Node, ok bool) {
+// Leave implements ast.InPlaceVisitor interface.
+func (nr *nameResolver) Leave(inNode ast.Node) bool {
 	//nolint: revive,all_revive
 	switch v := inNode.(type) {
 	case *ast.ColumnNameExpr:
 		for _, col := range nr.tableInfo.Columns {
 			if col.Name.L == v.Name.Name.L {
-				v.Refer = &ast.ResultField{
-					Column: col,
-					Table:  nr.tableInfo,
-				}
-				return inNode, true
+				return true
 			}
 		}
 		nr.err = errors.Errorf("can't find column %s in %s", v.Name.Name.O, nr.tableInfo.Name.O)
-		return inNode, false
+		return false
 	}
-	return inNode, true
+	return true
 }
 
 // ParseExpression parses an ExprNode from a string.
@@ -62,9 +60,27 @@ func (nr *nameResolver) Leave(inNode ast.Node) (node ast.Node, ok bool) {
 // of `ColumnInfo` is a string field, so we need to parse
 // it into ast.ExprNode. This function is for that.
 func ParseExpression(expr string) (node ast.ExprNode, err error) {
+	return parseExpression(expr, nil)
+}
+
+// ParseExpressionWithSQLMode parses an ExprNode using the specified SQL mode.
+// The SQL mode is part of the expression's parsing semantics for expressions
+// restored from metadata, such as materialized view schedules.
+func ParseExpressionWithSQLMode(expr string, sqlMode mysql.SQLMode) (node ast.ExprNode, err error) {
+	return parseExpression(expr, &sqlMode)
+}
+
+func parseExpression(expr string, sqlMode *mysql.SQLMode) (node ast.ExprNode, err error) {
 	expr = fmt.Sprintf("select %s", expr)
 	charset, collation := charset.GetDefaultCharsetAndCollate()
-	stmts, _, err := parser.New().ParseSQL(expr,
+	parse := parserutil.GetParser()
+	defer func() {
+		parserutil.DestroyParser(parse)
+	}()
+	if sqlMode != nil {
+		parse.SetSQLMode(*sqlMode)
+	}
+	stmts, _, err := parse.ParseSQL(expr,
 		parser.CharsetConnection(charset),
 		parser.CollationConnection(collation))
 	if err == nil {
@@ -76,7 +92,7 @@ func ParseExpression(expr string) (node ast.ExprNode, err error) {
 // SimpleResolveName resolves all column names in the expression node.
 func SimpleResolveName(node ast.ExprNode, tblInfo *model.TableInfo) (ast.ExprNode, error) {
 	nr := nameResolver{tblInfo, nil}
-	if _, ok := node.Accept(&nr); !ok {
+	if !ast.Walk(node, &nr) {
 		return nil, errors.Trace(nr.err)
 	}
 	return node, nil
